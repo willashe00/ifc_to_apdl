@@ -4,6 +4,12 @@ Converts a (federated) IFC model into one Mechanical APDL
 macro per classified system. Decks contain element types, materials, sections, geometry, mesh
 and boundary conditions only.
 
+## Install
+
+```
+pip install -r requirements.txt
+```
+
 ## Run
 
 ```
