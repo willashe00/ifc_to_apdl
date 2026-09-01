@@ -1,0 +1,32 @@
+[project]
+name = "ifc-to-apdl"
+version = "0.1.0"
+description = "Multi-system semantic graph-based conversion of IFC architectural models into preprocessing-only Mechanical APDL analytical models"
+requires-python = ">=3.11"
+dependencies = [
+    "ifcopenshell>=0.8",
+    "numpy",
+    "networkx",
+    "shapely>=2.0",
+    "pydantic>=2",
+    "trimesh",
+]
+
+[project.optional-dependencies]
+retrieval = ["sentence-transformers"]
+verify = ["ansys-mapdl-core"]
+dev = ["pytest", "mapbox-earcut"]
+
+[project.scripts]
+ifc2apdl = "ifc_to_apdl.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

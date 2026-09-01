@@ -1,0 +1,83 @@
+# ---- project ---------------------------------------------------------------
+test_models/
+outputs/
+
+# MAPDL scratch (verification runs)
+*.err
+*.lock
+*.page
+*.esav
+*.emat
+*.full
+*.rst
+*.db
+*.dbb
+*.log
+file*.out
+*.BCS
+*.mntr
+*.ldhi
+*.rdb
+*.stat
+*.DSP
+*.PVTS
+anaconda*.txt
+_mapdl_*/
+
+# ---- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# environments
+.env
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.cache/
+
+# type checkers / linters
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# jupyter
+.ipynb_checkpoints/
+
+# ---- editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- misc -------------------------------------------------------------------
+*.tmp
+*.bak
+*.orig
