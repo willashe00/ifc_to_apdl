@@ -134,18 +134,23 @@ def mesh_report(mapdl, deck_text: str, merge_tol: float = 1e-3) -> MeshReport:
     # panels): lost mass. With volumes present the elements belong to the
     # volumes (VMESH), so check those instead of their bounding areas.
     try:
-        n_vol = int(mapdl.get_value("VOLU", 0, "NUM", "MAX"))
+        # iterate over EXISTING entities only: VADD / booleans delete their
+        # operands, leaving gaps in the numbering
+        mapdl.allsel()
+        vnums = [int(v) for v in np.atleast_1d(mapdl.geometry.vnum)] if int(
+            mapdl.get_value("VOLU", 0, "COUNT")) > 0 else []
         empty = []
-        if n_vol > 0:
-            for v in range(1, n_vol + 1):
+        if vnums:
+            for v in vnums:
                 mapdl.vsel("S", "VOLU", "", v)
                 mapdl.eslv("S")
                 if int(mapdl.get_value("ELEM", 0, "COUNT")) == 0:
                     empty.append(v)
             kind = "volumes"
         else:
-            n_area = int(mapdl.get_value("AREA", 0, "NUM", "MAX"))
-            for a in range(1, n_area + 1):
+            anums = [int(a) for a in np.atleast_1d(mapdl.geometry.anum)] if int(
+                mapdl.get_value("AREA", 0, "COUNT")) > 0 else []
+            for a in anums:
                 mapdl.asel("S", "AREA", "", a)
                 mapdl.esla("S")
                 if int(mapdl.get_value("ELEM", 0, "COUNT")) == 0:
