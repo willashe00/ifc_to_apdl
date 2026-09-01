@@ -146,24 +146,100 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                                         product_guids=[r.guid for r in shells],
                                         evidence=why))
             rest = [r for r in recs if r not in shells]
-            if rest:
+            racks, frame = _split_equipment_racks(rest, shells, ctx)
+            for r in racks:
+                ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                                 detail="equipment support rack inside the containment "
+                                        "shell - not a structural frame")
+            if racks:
+                ctx.audit.event("classification",
+                                f"containment-{c_idx}: {len(racks)} equipment-support framing "
+                                "member(s) discarded (rack inside the shell footprint / "
+                                "rack naming)")
+            if frame:
                 b_idx += 1
                 systems.append(SystemRecord(
                     name=f"building-{b_idx}", domain="building",
-                    product_guids=[r.guid for r in rest],
+                    product_guids=[r.guid for r in frame],
                     evidence=[f"framing inside containment-{c_idx}: "
-                              f"{sorted({r.ifc_class for r in rest})}"]))
+                              f"{sorted({r.ifc_class for r in frame})}"]))
         else:
-            b_idx += 1
-            systems.append(SystemRecord(name=f"building-{b_idx}", domain="building",
-                                        product_guids=[r.guid for r in recs],
-                                        evidence=[f"framing classes {sorted(classes)}"]))
+            racks, frame = _split_equipment_racks(recs, [], ctx)
+            for r in racks:
+                ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                                 detail="equipment support rack (naming) - not a "
+                                        "structural frame")
+            if frame:
+                b_idx += 1
+                systems.append(SystemRecord(name=f"building-{b_idx}", domain="building",
+                                            product_guids=[r.guid for r in frame],
+                                            evidence=[f"framing classes {sorted(classes)}"]))
 
     for s in systems:
         ctx.audit.event("classification",
                         f"{s.name} ({s.domain}): {len(s.product_guids)} products; "
                         + "; ".join(s.evidence))
     return systems
+
+
+#: name tokens marking framing that only carries equipment (not a structure)
+RACK_TOKENS = ("support rack", "equipment support", "support frame", "skid", "pipe rack")
+
+
+def _split_equipment_racks(recs, shells, ctx: IfcContext):
+    """Separate equipment-support racks from real structural framing.
+
+    A rack is framing (beams / columns / members) that either
+      * is named as equipment support (``RACK_TOKENS``), or
+      * lies entirely inside a containment shell's plan footprint while the
+        framing set carries no slab, wall or plate of its own - a bare
+        beam/column cage inside the containment is an equipment support,
+        not part of the analysed structure.
+    Returns ``(racks, frame)``.
+    """
+    framing = {"IfcBeam", "IfcColumn", "IfcMember"}
+    bare = not any(r.ifc_class not in framing for r in recs)
+    footprints = []
+    for sh in shells:
+        prm = _revolution_params_of(sh, ctx)
+        if prm is not None and prm.kind == "cylinder":
+            footprints.append((prm.params["cx"], prm.params["cy"], prm.params["r_outer"]))
+    racks, frame = [], []
+    for r in recs:
+        name = (r.name or "").lower()
+        if r.ifc_class in framing and any(tok in name for tok in RACK_TOKENS):
+            racks.append(r)
+            continue
+        if r.ifc_class in framing and bare and footprints:
+            pts = _body_endpoints(ctx, r)
+            if pts and all(any(((p[0] - cx) ** 2 + (p[1] - cy) ** 2) ** 0.5 <= r_out
+                               for cx, cy, r_out in footprints) for p in pts):
+                racks.append(r)
+                continue
+        frame.append(r)
+    return racks, frame
+
+
+def _revolution_params_of(rec, ctx: IfcContext):
+    """SolidParams of a product body of revolution, or None."""
+    from ..geometry.swept import cylinder_params, dome_params
+    for ri in rec.body_items:
+        item = ri.item
+        try:
+            if item.is_a("IfcExtrudedAreaSolid") and item.SweptArea.is_a() in (
+                    "IfcCircleProfileDef", "IfcCircleHollowProfileDef"):
+                return cylinder_params(item, ri.matrix, ctx.length_scale)
+            if item.is_a("IfcRevolvedAreaSolid") or item.is_a("IfcBooleanResult"):
+                return dome_params(item, ri.matrix, ctx.length_scale, ctx.angle_scale)
+            if item.is_a("IfcTriangulatedFaceSet"):
+                from ..geometry.tessellated import mesh_from_faceset, revolution_params
+                verts, faces = mesh_from_faceset(item, ctx.length_scale, ri.matrix)
+                prm = revolution_params(verts, faces)
+                if prm is not None:
+                    return prm
+        except Exception:
+            continue
+    return None
 
 
 def _revolution_body(rec, ctx: IfcContext) -> bool:
