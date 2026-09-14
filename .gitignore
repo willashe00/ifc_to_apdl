@@ -1,6 +1,8 @@
 # ---- project ---------------------------------------------------------------
 test_models/
 outputs/
+nph_presentation/
+dissertation/
 
 # MAPDL scratch (verification runs)
 *.err
@@ -41,6 +43,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # environments
+.claude/
 .env
 .venv/
 venv/

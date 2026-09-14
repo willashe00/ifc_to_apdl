@@ -19,7 +19,7 @@ from ..ingest.loader import (
     STRUCTURAL_CLASSES, is_hanger,
 )
 from ..report.audit import AuditStatus
-from .graph import build_graph
+from .graph import build_graph, edge_layers
 
 #: capture radius [m] for associating a hanger member with the piping run
 #: it supports (typical rod-to-pipe stand-off is the pipe outer radius)
@@ -48,7 +48,7 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
     dist_guids = [r.guid for r in ctx.products.values() if r.ifc_class in DISTRIBUTION_CLASSES]
     sub = g.subgraph(dist_guids)
     for i, comp in enumerate(sorted(nx.connected_components(sub), key=len, reverse=True), 1):
-        layers = {d["layer"] for _, _, d in sub.edges(comp, data=True)}
+        layers = edge_layers(sub, comp)
         rec = SystemRecord(name=f"piping-{i}", domain="piping",
                            product_guids=sorted(comp),
                            evidence=[f"connectivity layers: {sorted(layers) or ['isolated']}"])

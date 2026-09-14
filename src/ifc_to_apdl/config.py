@@ -100,8 +100,9 @@ class ConversionConfig(BaseModel):
     vertical_axis: Literal["y", "z"] = Field(
         "y",
         description=(
-            "'y': IFC Z-up is emitted with APDL Y vertical (permutation X,Y,Z -> X,Z,Y; "
-            "matches the legacy reference decks). 'z': keep the IFC frame unchanged."
+            "'y': IFC Z-up is emitted with APDL Y vertical by a proper rotation about X "
+            "(APDL X,Y,Z = IFC X,Z,-Y; a plain Y/Z swap would mirror the plan). "
+            "'z': keep the IFC frame unchanged."
         ),
     )
     merge_tolerance: Optional[float] = Field(

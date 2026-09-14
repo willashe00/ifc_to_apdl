@@ -22,6 +22,29 @@ from ..ingest.loader import DISTRIBUTION_CLASSES, IfcContext
 from ..geometry.swept import extruded_axis, revolved_arc
 
 
+def _add_edge(g: nx.Graph, a: str, b: str, layer: str, via: str) -> None:
+    """Record an evidence edge without discarding evidence already present.
+
+    A pair of products is typically connected on several layers at once
+    (ports AND coincident endpoints AND one system); ``Graph.add_edge`` on an
+    existing edge would silently overwrite the earlier layer's attributes, so
+    the layers are accumulated in ``layers`` and ``layer`` keeps the first."""
+    if g.has_edge(a, b):
+        data = g.edges[a, b]
+        data.setdefault("layers", {data["layer"]}).add(layer)
+        data.setdefault("vias", {data["via"]}).add(via)
+    else:
+        g.add_edge(a, b, layer=layer, via=via, layers={layer}, vias={via})
+
+
+def edge_layers(g: nx.Graph, nodes) -> set[str]:
+    """Union of evidence layers over the edges among ``nodes``."""
+    out: set[str] = set()
+    for _, _, d in g.edges(nodes, data=True):
+        out |= d.get("layers", {d["layer"]})
+    return out
+
+
 def build_graph(ctx: IfcContext, proximity_tol: float = 1e-3) -> nx.Graph:
     g = nx.Graph()
     for rec in ctx.products.values():
@@ -34,7 +57,7 @@ def build_graph(ctx: IfcContext, proximity_tol: float = 1e-3) -> nx.Graph:
             by_system[sg].append(rec.guid)
     for sg, members in by_system.items():
         for a, b in zip(members, members[1:]):
-            g.add_edge(a, b, layer="E_A", via=f"system:{sg[:8]}")
+            _add_edge(g, a, b, "E_A", f"system:{sg[:8]}")
 
     # E_P: port connectivity
     port_owner: dict[int, str] = {}
@@ -49,7 +72,7 @@ def build_graph(ctx: IfcContext, proximity_tol: float = 1e-3) -> nx.Graph:
         a = port_owner.get(rel.RelatingPort.id())
         b = port_owner.get(rel.RelatedPort.id())
         if a and b and a != b:
-            g.add_edge(a, b, layer="E_P", via="ports")
+            _add_edge(g, a, b, "E_P", "ports")
 
     # E_G: endpoint coincidence between distribution elements
     endpoints: dict[tuple[int, int, int], list[str]] = defaultdict(list)
@@ -65,7 +88,7 @@ def build_graph(ctx: IfcContext, proximity_tol: float = 1e-3) -> nx.Graph:
                     for dz in (-1, 0, 1):
                         for other in endpoints.get((cell[0] + dx, cell[1] + dy, cell[2] + dz), ()):
                             if other != rec.guid:
-                                g.add_edge(rec.guid, other, layer="E_G", via="endpoint-coincidence")
+                                _add_edge(g, rec.guid, other, "E_G", "endpoint-coincidence")
             endpoints[cell].append(rec.guid)
     return g
 
