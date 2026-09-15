@@ -1,8 +1,8 @@
 # ---- project ---------------------------------------------------------------
 test_models/
 outputs/
-nph_presentation/
-dissertation/
+verification_tests/
+docs/
 
 # MAPDL scratch (verification runs)
 *.err

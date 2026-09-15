@@ -151,6 +151,8 @@ def guess_family(text: str) -> str | None:
             return fam
     if re.search(r"\bgl\s?\d{2}[ch]?\b", t):                           # GL24h glulam
         return "timber"
+    if "alumin" in t:            # before the generic 'metal' token: Revit's stock
+        return "aluminum"        # name is 'Metal - Aluminum' (experiment_set_01)
     if any(k in t for k in ("steel", "metal", "iron", "stahl", "a992", "a36",
                             "a106", "a53", "sa-312", "tp304", "tp316")):
         return "steel"
@@ -160,8 +162,6 @@ def guess_family(text: str) -> str | None:
         return "concrete"
     if re.search(r"\bl?c\s?\d{2}\s*[/-]\s*\d{2}\b", t):                # C30/37, LC30/33
         return "concrete"
-    if "alumin" in t:
-        return "aluminum"
     return None
 
 

@@ -44,15 +44,13 @@ class MeshConfig(BaseModel):
 
 class MaterialConfig(BaseModel):
     similarity_threshold: float = Field(
-        0.45, ge=-1, le=1,
+        0.475, ge=-1, le=1,
         description="Cosine-similarity acceptance threshold (embedding backend). "
-        "Validated for all-MiniLM-L6-v2 on a 73-name realistic corpus "
-        "(experiments/material_tests/experiment_02): 93.9% acceptance of informative "
-        "names at 100% family precision with every placeholder and out-of-scope "
-        "name flagged (vague names below tau flag conservatively); 0.45 sits "
-        "centered in the empirical operating window [0.43, 0.47]. Thresholds are "
-        "encoder-specific; recalibrate on the corpus when the embedding model "
-        "changes.",
+        "Calibrated for all-MiniLM-L6-v2 on a 689-name realistic corpus "
+        "(verification_tests/material_assignment/experiment_set_01) as the "
+        "Youden-optimal threshold (J = TPR + TNR - 1 maximal at 0.475; bootstrap "
+        "95% interval [0.44, 0.475]). Thresholds are encoder-specific; recalibrate "
+        "on the corpus when the embedding model changes.",
     )
     fallback_threshold: float = Field(
         0.50, ge=0, le=1, description="Acceptance threshold for the lexical fallback scorer"
