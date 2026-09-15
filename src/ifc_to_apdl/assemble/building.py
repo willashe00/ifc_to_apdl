@@ -1062,8 +1062,18 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
             converted.add(s.rec.guid)
 
     # -- step 5: wall partitioning --------------------------------------------
+    #    Only walls standing on the structure's lowest support level contribute
+    #    base edges to the fixity (foundation walls may reach up to
+    #    SUPPORT_REACH below/above the column bases). Per-storey walls stacked
+    #    on upper levels rest on the slab below, not on the ground - fixing
+    #    their base edges would clamp the building at every floor
+    #    (defect found by verification_tests/mesh_size/experiment_set_01:
+    #    an 8-storey core tower lost its sway modes, f1 13.7 Hz instead of 3 Hz).
+    SUPPORT_REACH = 0.5
     wall_base_edges: list[tuple[int, int]] = []
+    support_z = min([c.base[2] for c in columns] + [w.z_lo for w in walls])         if (columns or walls) else 0.0
     for w in walls:
+        on_ground = w.z_lo <= support_z + max(snap_tol, SUPPORT_REACH)
         mat = resolver.resolve(w.rec, "building", "shell")
         mat_id = model.add_material(mat)
         sec_id = model.add_section(
@@ -1131,7 +1141,7 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
                             {**w.evidence,
                              "partition": f"panel u[{i}] v[{j}] of "
                                           f"{len(u_cuts) - 1}x{len(v_cuts) - 1}"})
-                if j == 0:
+                if j == 0 and on_ground:
                     wall_base_edges.append((k1, k2))
         converted.add(w.rec.guid)
 
