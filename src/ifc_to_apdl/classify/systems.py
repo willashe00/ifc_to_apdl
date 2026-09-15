@@ -12,14 +12,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import networkx as nx
-
 from ..ingest.loader import (
     ACCESSORY_CLASSES, DISTRIBUTION_CLASSES, EQUIPMENT_CLASSES, IfcContext,
     STRUCTURAL_CLASSES, is_hanger,
 )
 from ..report.audit import AuditStatus
-from .graph import build_graph, edge_layers
+from .graph import build_graph, continuity_components, edge_layers
 
 #: capture radius [m] for associating a hanger member with the piping run
 #: it supports (typical rod-to-pipe stand-off is the pipe outer radius)
@@ -44,10 +42,26 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
             ctx.audit.record(rec.guid, rec.ifc_class, rec.name, AuditStatus.EXCLUDED,
                              detail="equipment class — outside analytical conversion scope")
 
-    # -- piping systems: connected components over E_A|E_P|E_G ----------------
+    # -- piping systems: one per physically continuous run ---------------------
+    #    components over E_P|E_G only. Shared IfcDistributionSystem membership
+    #    (E_A) is not continuity: a declared system spanning several separate
+    #    runs is split at the run ends, so each deck is one continuous network
     dist_guids = [r.guid for r in ctx.products.values() if r.ifc_class in DISTRIBUTION_CLASSES]
     sub = g.subgraph(dist_guids)
-    for i, comp in enumerate(sorted(nx.connected_components(sub), key=len, reverse=True), 1):
+    runs = sorted(continuity_components(g, dist_guids),
+                  key=lambda c: (-len(c), min(c)))
+    run_of = {guid: i for i, comp in enumerate(runs, 1) for guid in comp}
+    declared: dict[str, set[int]] = {}
+    for guid in dist_guids:
+        for sg in ctx.products[guid].system_guids:
+            declared.setdefault(sg, set()).add(run_of[guid])
+    for sg, idx in sorted(declared.items()):
+        if len(idx) > 1:
+            ctx.audit.event("classification",
+                            f"declared distribution system {sg[:8]} spans {len(idx)} "
+                            "physically discontinuous runs; split at run ends into "
+                            f"{', '.join(f'piping-{i}' for i in sorted(idx))}")
+    for i, comp in enumerate(runs, 1):
         layers = edge_layers(sub, comp)
         rec = SystemRecord(name=f"piping-{i}", domain="piping",
                            product_guids=sorted(comp),
