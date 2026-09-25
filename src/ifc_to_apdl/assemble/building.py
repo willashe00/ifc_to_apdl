@@ -1284,20 +1284,27 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
 
     # -- step 6: supports ------------------------------------------------------
     if config.bcs.building == "base-fixed" and (columns or wall_base_edges):
-        # columns anchor at their own lowest base cluster; walls at their own
-        # base edges — a single global minimum would leave the frame floating
-        # when foundation walls reach deeper than the column bases
+        # columns anchor at their own lowest base cluster, plus every column
+        # whose excluded base plate the classifier found it standing on (a
+        # thicker plate can seat a column above that cluster); walls at their
+        # own base edges — a single global minimum would leave the frame
+        # floating when foundation walls reach deeper than the column bases
         col_nodes: list[int] = []
+        plated = set(system.fixed_columns)
         if columns:
             col_base_z = min(c.base[2] for c in columns)
             col_nodes = sorted({model.nodes.get((c.base[0], c.base[1], c.base[2]))
-                                for c in columns if abs(c.base[2] - col_base_z) < snap_tol})
+                                for c in columns if abs(c.base[2] - col_base_z) < snap_tol
+                                or c.rec.guid in plated})
         model.supports.append(Support(name="BASE_FIX", nodes=col_nodes,
                                       edges=wall_base_edges,
                                       source="heuristic:base-fixed"))
+        n_plated = sum(1 for c in columns if c.rec.guid in plated)
         ctx.audit.event("boundary-condition",
                         f"{system.name}: fixed base at {len(col_nodes)} column base node(s)"
                         + (f" (z={col_base_z:g})" if col_nodes else "")
+                        + (f", {n_plated} of them in place of excluded base plates"
+                           if n_plated else "")
                         + f" and {len(wall_base_edges)} wall base edge(s) "
                         "[heuristic base-fixed]", severity="warning")
     return model

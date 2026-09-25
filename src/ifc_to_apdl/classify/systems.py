@@ -30,6 +30,8 @@ class SystemRecord:
     domain: str                      # 'building' | 'piping' | 'containment'
     product_guids: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
+    #: columns whose base plate was excluded: fixed at the foot in place of it
+    fixed_columns: list[str] = field(default_factory=list)
 
 
 def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[SystemRecord]:
@@ -128,6 +130,17 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
 
     b_idx = c_idx = 0
     for bldg, recs in sorted(by_building.items()):
+        # column base plates are connection hardware, not frame: excluded
+        # first (a leftover plate would also defeat the bare-cage rack rule),
+        # and the columns standing on them are fixed at the foot instead
+        plates, recs, seated = _split_base_plates(recs, ctx)
+        for r, why in plates:
+            ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                             detail=f"column base plate ({why}) - connection hardware; "
+                                    "the column is fixed at its foot instead")
+        if not recs:
+            continue
+        n_before = len(systems)
         classes = {r.ifc_class for r in recs}
 
         # containment evidence: products whose body is a vertical body of
@@ -182,7 +195,8 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                     name=f"building-{b_idx}", domain="building",
                     product_guids=[r.guid for r in frame],
                     evidence=[f"framing inside containment-{c_idx}: "
-                              f"{sorted({r.ifc_class for r in frame})}"]))
+                              f"{sorted({r.ifc_class for r in frame})}"],
+                    fixed_columns=[g for g in seated if g in {r.guid for r in frame}]))
         else:
             racks, frame = _split_equipment_racks(recs, [], ctx)
             for r in racks:
@@ -193,7 +207,13 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                 b_idx += 1
                 systems.append(SystemRecord(name=f"building-{b_idx}", domain="building",
                                             product_guids=[r.guid for r in frame],
-                                            evidence=[f"framing classes {sorted(classes)}"]))
+                                            evidence=[f"framing classes {sorted(classes)}"],
+                                            fixed_columns=[g for g in seated
+                                                           if g in {r.guid for r in frame}]))
+        for s in systems[n_before:]:
+            if plates and s.domain == "building":
+                s.evidence.append(f"{len(plates)} column base plate(s) excluded, "
+                                  f"{len(s.fixed_columns)} column(s) fixed at the foot")
 
     for s in systems:
         ctx.audit.event("classification",
@@ -211,6 +231,117 @@ RACK_TOKENS = ("support rack", "equipment support", "support frame", "skid", "pi
 #: declared containment semantics, matched in shell product names and in the
 #: containing IfcBuilding's Name / LongName / ObjectType / Description
 CONTAINMENT_TOKENS = ("containment", "dome", "basemat", "cylindrical")
+
+#: name tokens marking column base plates (plate name, ObjectType, or the
+#: name of the element assembly the plate is aggregated into)
+BASE_PLATE_TOKENS = ("base plate", "baseplate", "base_plate", "base-plate")
+#: plan radius [m] around the column axis a base plate may occupy: a base
+#: plate only cantilevers a short projection beyond the column section, so a
+#: plate reaching further from the axis is a floor plate, not a base plate
+BASE_PLATE_REACH = 1.0
+#: tolerance [m] for a column foot seated on a plate face
+BASE_PLATE_SEAT = 0.025
+#: column feet within this height [m] of the lowest foot are at the support
+#: level (same reach the building assembler uses for base supports)
+SUPPORT_LEVEL_REACH = 0.5
+
+
+def _split_base_plates(recs, ctx: IfcContext):
+    """Separate column base plates from the structural products.
+
+    A base plate is connection hardware between a column foot and its
+    foundation: the analytical column ends at its foot and is fixed there,
+    so the plate is not converted. Evidence cascade (first hit wins):
+      * declared - PredefinedType BASE_PLATE on the occurrence or its type
+        object (IFC4X3 IfcPlateTypeEnum);
+      * named - the plate, its ObjectType, or the element assembly it is
+        aggregated into carries a base-plate token (``BASE_PLATE_TOKENS``);
+      * geometric - a thin horizontal plate carrying the foot of a column at
+        the support level and lying within ``BASE_PLATE_REACH`` of that
+        column's axis. Plates at column splices higher up are left alone:
+        they are the only link between stacked column pieces.
+    Returns ``(plates, rest, seated)``: ``(record, evidence)`` pairs, the
+    remaining records, and the GUIDs of the columns found standing on an
+    excluded plate at the support level.
+    """
+    import ifcopenshell.util.element as ioe
+
+    feet = _column_feet(recs, ctx)
+    support_z = min((p[2] for _, p in feet), default=0.0)
+    plates, rest, seated = [], [], []
+    for r in recs:
+        if r.ifc_class != "IfcPlate":
+            rest.append(r)
+            continue
+        why = None
+        ptype = (ioe.get_predefined_type(r.entity) or "").upper()
+        if ptype == "BASE_PLATE":
+            why = "declared PredefinedType BASE_PLATE"
+        else:
+            agg = ioe.get_aggregate(r.entity)
+            labels = [r.name, getattr(r.entity, "ObjectType", None) or "",
+                      (getattr(agg, "Name", None) or "") if agg is not None else ""]
+            if any(tok in " ".join(labels).lower() for tok in BASE_PLATE_TOKENS):
+                why = "base-plate naming"
+        # only feet at the support level are grounded: a column on a base
+        # plate higher up (e.g. on a transfer girder) bears on the frame
+        on = [(g, p) for g, p in _plate_seats(r, feet, ctx)
+              if p[2] - support_z <= SUPPORT_LEVEL_REACH]
+        if why is None and on:
+            why = "thin horizontal plate under a column foot at the support level"
+        if why is None:
+            rest.append(r)
+            continue
+        plates.append((r, why))
+        seated += [g for g, _ in on if g not in seated]
+    return plates, rest, seated
+
+
+def _column_feet(recs, ctx: IfcContext):
+    """``(guid, lowest axis point)`` of every column: extrusion axis, else the
+    Axis representation."""
+    from ..geometry.axes import axis_rep_endpoints
+
+    feet = []
+    for r in recs:
+        if r.ifc_class != "IfcColumn":
+            continue
+        pts = _body_endpoints(ctx, r) or list(axis_rep_endpoints(r.axis_items,
+                                                                 ctx.length_scale) or [])
+        if pts:
+            feet.append((r.guid, min(pts, key=lambda p: p[2])))
+    return feet
+
+
+def _plate_seats(rec, feet, ctx: IfcContext):
+    """Column feet ``(guid, point)`` that stand on a plate: the plate is thin
+    and horizontal, the foot lies on its plan outline between its faces
+    (within ``BASE_PLATE_SEAT``) and the whole plate is local to that column
+    (within ``BASE_PLATE_REACH`` of its axis)."""
+    from shapely.geometry import Point, Polygon
+
+    from ..geometry.swept import plate_from_extrusion
+
+    out = []
+    for ri in rec.body_items:
+        if not ri.item.is_a("IfcExtrudedAreaSolid"):
+            continue
+        try:
+            pg = plate_from_extrusion(ri.item, ri.matrix, ctx.length_scale)
+        except Exception:
+            continue
+        if abs(pg.normal[2]) < 0.99 or len(pg.loop) < 3:
+            continue
+        mid = sum(p[2] for p in pg.loop) / len(pg.loop)
+        lo, hi = mid - pg.thickness / 2.0, mid + pg.thickness / 2.0
+        outline = Polygon([(p[0], p[1]) for p in pg.loop]).buffer(BASE_PLATE_SEAT)
+        for guid, (x, y, z) in feet:
+            if (lo - BASE_PLATE_SEAT <= z <= hi + BASE_PLATE_SEAT
+                    and outline.contains(Point(x, y))
+                    and all(((p[0] - x) ** 2 + (p[1] - y) ** 2) ** 0.5 <= BASE_PLATE_REACH
+                            for p in pg.loop)):
+                out.append((guid, (x, y, z)))
+    return out
 
 
 def _split_equipment_racks(recs, shell_forms, ctx: IfcContext):
