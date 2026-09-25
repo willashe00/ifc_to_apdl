@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 
 from ..ingest.loader import (
     ACCESSORY_CLASSES, DISTRIBUTION_CLASSES, EQUIPMENT_CLASSES, IfcContext,
-    STRUCTURAL_CLASSES, is_hanger,
+    STRUCTURAL_CLASSES, is_footing, is_hanger,
 )
 from ..report.audit import AuditStatus
 from .graph import build_graph, continuity_components, edge_layers
@@ -30,6 +30,8 @@ class SystemRecord:
     domain: str                      # 'building' | 'piping' | 'containment'
     product_guids: list[str] = field(default_factory=list)
     evidence: list[str] = field(default_factory=list)
+    #: columns whose base plate was excluded: fixed at the foot in place of it
+    fixed_columns: list[str] = field(default_factory=list)
 
 
 def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[SystemRecord]:
@@ -128,6 +130,17 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
 
     b_idx = c_idx = 0
     for bldg, recs in sorted(by_building.items()):
+        # column base plates are connection hardware, not frame: excluded
+        # first (a leftover plate would also defeat the bare-cage rack rule),
+        # and the columns standing on them are fixed at the foot instead
+        plates, recs, seated = _split_base_plates(recs, ctx)
+        for r, why in plates:
+            ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                             detail=f"column base plate ({why}) - connection hardware; "
+                                    "the column is fixed at its foot instead")
+        if not recs:
+            continue
+        n_before = len(systems)
         classes = {r.ifc_class for r in recs}
 
         # containment evidence: products whose body is a vertical body of
@@ -145,6 +158,10 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                     forms[r.guid] = fit
         shells = [r for r in recs if r.guid in forms]
         rest = [r for r in recs if r.guid not in forms]
+        # slabs on grade bear on the foundation, not on the frame (split
+        # before the rack test for the same reason as base plates); shells
+        # are left alone - a containment basemat is a shell, not a ground slab
+        ground, rest = _split_ground_slabs(rest, recs, ctx)
         racks, frame = _split_equipment_racks(rest, [f.params for f in forms.values()], ctx)
 
         score, why = 0, []
@@ -176,24 +193,49 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                                 f"containment-{c_idx}: {len(racks)} equipment-support framing "
                                 "member(s) discarded (rack inside the shell footprint / "
                                 "rack naming)")
+            envelope, frame = _split_envelope(frame, ctx)
             if frame:
                 b_idx += 1
                 systems.append(SystemRecord(
                     name=f"building-{b_idx}", domain="building",
                     product_guids=[r.guid for r in frame],
                     evidence=[f"framing inside containment-{c_idx}: "
-                              f"{sorted({r.ifc_class for r in frame})}"]))
+                              f"{sorted({r.ifc_class for r in frame})}"],
+                    fixed_columns=[g for g in seated if g in {r.guid for r in frame}]))
         else:
-            racks, frame = _split_equipment_racks(recs, [], ctx)
+            # an ordinary building: a round slab on grade is a ground slab too
+            ground += _split_ground_slabs(shells, recs, ctx)[0]
+            gone = {r.guid for r, _ in ground}
+            racks, frame = _split_equipment_racks([r for r in recs if r.guid not in gone], [], ctx)
             for r in racks:
                 ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
                                  detail="equipment support rack (naming) - not a "
                                         "structural frame")
+            envelope, frame = _split_envelope(frame, ctx)
             if frame:
                 b_idx += 1
                 systems.append(SystemRecord(name=f"building-{b_idx}", domain="building",
                                             product_guids=[r.guid for r in frame],
-                                            evidence=[f"framing classes {sorted(classes)}"]))
+                                            evidence=[f"framing classes {sorted(classes)}"],
+                                            fixed_columns=[g for g in seated
+                                                           if g in {r.guid for r in frame}]))
+        for r, why in ground:
+            ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                             detail=f"ground slab ({why}) - rests on grade; the column / "
+                                    "wall bases are fixed instead")
+        for r, why in envelope:
+            ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                             detail=f"non-load-bearing envelope ({why}) - neither its "
+                                    "stiffness nor its mass enters the model")
+        for s in systems[n_before:]:
+            if envelope and s.domain == "building":
+                s.evidence.append(f"{len(envelope)} non-load-bearing envelope element(s) "
+                                  "excluded")
+            if plates and s.domain == "building":
+                s.evidence.append(f"{len(plates)} column base plate(s) excluded, "
+                                  f"{len(s.fixed_columns)} column(s) fixed at the foot")
+            if ground and s.domain == "building":
+                s.evidence.append(f"{len(ground)} ground slab(s) excluded")
 
     for s in systems:
         ctx.audit.event("classification",
@@ -211,6 +253,392 @@ RACK_TOKENS = ("support rack", "equipment support", "support frame", "skid", "pi
 #: declared containment semantics, matched in shell product names and in the
 #: containing IfcBuilding's Name / LongName / ObjectType / Description
 CONTAINMENT_TOKENS = ("containment", "dome", "basemat", "cylindrical")
+
+#: name tokens marking column base plates (plate name, ObjectType, or the
+#: name of the element assembly the plate is aggregated into)
+BASE_PLATE_TOKENS = ("base plate", "baseplate", "base_plate", "base-plate")
+#: plan radius [m] around the column axis a base plate may occupy: a base
+#: plate only cantilevers a short projection beyond the column section, so a
+#: plate reaching further from the axis is a floor plate, not a base plate
+BASE_PLATE_REACH = 1.0
+#: tolerance [m] for a column foot seated on a plate face
+BASE_PLATE_SEAT = 0.025
+#: column feet within this height [m] of the lowest foot are at the support
+#: level (same reach the building assembler uses for base supports)
+SUPPORT_LEVEL_REACH = 0.5
+
+
+def _split_base_plates(recs, ctx: IfcContext):
+    """Separate column base plates from the structural products.
+
+    A base plate is connection hardware between a column foot and its
+    foundation: the analytical column ends at its foot and is fixed there,
+    so the plate is not converted. Evidence cascade (first hit wins):
+      * declared - PredefinedType BASE_PLATE on the occurrence or its type
+        object (IFC4X3 IfcPlateTypeEnum);
+      * named - the plate, its ObjectType, or the element assembly it is
+        aggregated into carries a base-plate token (``BASE_PLATE_TOKENS``);
+      * geometric - a thin horizontal plate carrying the foot of a column at
+        the support level and lying within ``BASE_PLATE_REACH`` of that
+        column's axis. Plates at column splices higher up are left alone:
+        they are the only link between stacked column pieces.
+    Returns ``(plates, rest, seated)``: ``(record, evidence)`` pairs, the
+    remaining records, and the GUIDs of the columns found standing on an
+    excluded plate at the support level.
+    """
+    import ifcopenshell.util.element as ioe
+
+    feet = _column_feet(recs, ctx)
+    support_z = min((p[2] for _, p in feet), default=0.0)
+    plates, rest, seated = [], [], []
+    for r in recs:
+        if r.ifc_class != "IfcPlate":
+            rest.append(r)
+            continue
+        why = None
+        ptype = (ioe.get_predefined_type(r.entity) or "").upper()
+        if ptype == "BASE_PLATE":
+            why = "declared PredefinedType BASE_PLATE"
+        else:
+            agg = ioe.get_aggregate(r.entity)
+            labels = [r.name, getattr(r.entity, "ObjectType", None) or "",
+                      (getattr(agg, "Name", None) or "") if agg is not None else ""]
+            if any(tok in " ".join(labels).lower() for tok in BASE_PLATE_TOKENS):
+                why = "base-plate naming"
+        # only feet at the support level are grounded: a column on a base
+        # plate higher up (e.g. on a transfer girder) bears on the frame
+        on = [(g, p) for g, p in _plate_seats(r, feet, ctx)
+              if p[2] - support_z <= SUPPORT_LEVEL_REACH]
+        if why is None and on:
+            why = "thin horizontal plate under a column foot at the support level"
+        if why is None:
+            rest.append(r)
+            continue
+        plates.append((r, why))
+        seated += [g for g, _ in on if g not in seated]
+    return plates, rest, seated
+
+
+#: tolerance [m] for a slab top face lying at the support level
+GROUND_SLAB_SEAT = 0.025
+
+
+def _split_ground_slabs(cands, recs, ctx: IfcContext):
+    """Separate slabs on grade from the building frame.
+
+    A slab bearing on the ground at the support level is not part of the
+    analysed structure: the column and wall bases are fixed, which idealises
+    the foundation (base plates and ground slab alike), so the slab is not
+    converted (typical practice). Footings stay with ``footing_policy``.
+    Evidence (first hit wins):
+      * declared - PredefinedType BASESLAB (IFC: 'base slab, including slab
+        on grade');
+      * geometric - the slab's top face is at or below the support level,
+        i.e. the lowest column foot or wall base among ``recs``. Walls
+        reaching below a slab keep it (a podium slab over walls is carried
+        by them), which errs on the side of converting a doubtful slab.
+    Returns ``(slabs, rest)`` with slabs as ``(record, evidence)`` pairs.
+    """
+    import ifcopenshell.util.element as ioe
+
+    bases = [p[2] for _, p in _column_feet(recs, ctx)]
+    bases += [z[0] for z in (_z_range(r, ctx) for r in recs if r.ifc_class == "IfcWall") if z]
+    support_z = min(bases, default=None)
+    slabs, rest = [], []
+    for r in cands:
+        why = None
+        if r.ifc_class == "IfcSlab" and not is_footing(r):
+            if (ioe.get_predefined_type(r.entity) or "").upper() == "BASESLAB":
+                why = "declared PredefinedType BASESLAB"
+            elif support_z is not None:
+                z = _z_range(r, ctx)
+                if z and z[1] <= support_z + GROUND_SLAB_SEAT:
+                    why = (f"top face z={z[1]:.3f} m at or below the support level "
+                           f"z={support_z:.3f} m")
+        if why is None:
+            rest.append(r)
+        else:
+            slabs.append((r, why))
+    return slabs, rest
+
+
+#: IfcWall PredefinedTypes that are non-load-bearing / load-bearing by definition
+NONBEARING_WALL_TYPES = ("PARTITIONING", "PARAPET")
+BEARING_WALL_TYPES = ("SHEAR", "RETAININGWALL")
+#: material families that carry no load in a wall or slab build-up
+NONSTRUCTURAL_FAMILIES = ("insulation", "gypsum", "glass")
+#: steel layers thinner than this [m] are sheet (cladding skins, decking)
+SHEET_STEEL_MAX = 0.003
+#: ACI 318-19 Table 11.3.1.1, bearing walls: thickness at least the greater
+#: of 4 in and 1/25 of the lesser of the unsupported length and height
+BEARING_WALL_T_MIN = 0.1016
+BEARING_WALL_SLENDERNESS = 25.0
+#: framing members at most this far apart [m] carry a sheet everywhere
+DECK_SUPPORT_SPACING = 3.0
+#: face-contact tolerance [m] between envelope elements and the frame
+CONTACT_TOL = 0.025
+
+
+def _split_envelope(recs, ctx: IfcContext):
+    """Separate non-load-bearing envelope elements - cladding walls, roofing,
+    decking - from the structural frame. Everything is kept unless the
+    evidence says otherwise, so load-bearing walls and slabs survive:
+      * declared (decisive either way): a LoadBearing property
+        (Pset_WallCommon / Pset_SlabCommon / Pset_RoofCommon), or an IfcWall
+        PredefinedType non-load-bearing (PARTITIONING, PARAPET) or
+        load-bearing (SHEAR, RETAININGWALL) by definition;
+      * walls - two independent signals must agree: the material build-up
+        has no load-bearing layer (insulation / gypsum / glass and steel
+        skins thinner than ``SHEET_STEEL_MAX`` only; unknown materials count
+        as load-bearing), AND the whole wall is thinner than the ACI 318
+        minimum for a bearing wall of its unsupported height and length;
+      * slabs / roofs - two signals: the build-up has no concrete, masonry
+        or timber body (metal sheet or plate only), AND framing members
+        directly beneath carry it everywhere (``DECK_SUPPORT_SPACING``).
+    A non-structural build-up without the second signal only earns a review
+    warning; the element is kept.
+    Returns ``(envelope, rest)`` with envelope as ``(record, evidence)`` pairs.
+    """
+    import ifcopenshell.util.element as ioe
+
+    from shapely.geometry import MultiPoint
+
+    if not any(r.ifc_class in ("IfcWall", "IfcSlab", "IfcRoof") for r in recs):
+        return [], list(recs)
+    clouds = {r.guid: _cloud(r, ctx) for r in recs}
+    feet = {g: MultiPoint([tuple(p) for p in v[:, :2]]).convex_hull
+            for g, v in clouds.items() if v is not None}
+    envelope, rest = [], []
+    for r in recs:
+        why = None
+        if r.ifc_class in ("IfcWall", "IfcSlab", "IfcRoof") and clouds[r.guid] is not None:
+            declared, pset = _declared_load_bearing(r)
+            ptype = (ioe.get_predefined_type(r.entity) or "").upper()
+            if declared is not None:
+                why = None if declared else f"declared {pset}.LoadBearing = FALSE"
+            elif r.ifc_class == "IfcWall" and ptype in BEARING_WALL_TYPES:
+                why = None
+            elif r.ifc_class == "IfcWall" and ptype in NONBEARING_WALL_TYPES:
+                why = f"declared PredefinedType {ptype}"
+            else:
+                signals = (_wall_signals(r, recs, clouds, feet, ctx) if r.ifc_class == "IfcWall"
+                           else _deck_signals(r, recs, clouds, ctx))
+                if all(signals):
+                    why = "; ".join(signals)
+                elif signals[0]:
+                    # a non-structural build-up alone is worth a look; the
+                    # geometric signal alone is normal (floors sit on beams)
+                    ctx.audit.event("classification",
+                                    f"'{r.name}' is possibly non-structural ({signals[0]}) but "
+                                    "the second signal is missing - kept, review",
+                                    guid=r.guid, severity="warning")
+        if why is None:
+            rest.append(r)
+        else:
+            envelope.append((r, why))
+    return envelope, rest
+
+
+def _declared_load_bearing(rec):
+    """``(LoadBearing, pset name)`` from the element's property sets, or
+    ``(None, None)`` when nothing is declared."""
+    for name, props in rec.psets.items():
+        val = props.get("LoadBearing") if isinstance(props, dict) else None
+        if isinstance(val, bool):
+            return val, name
+    return None, None
+
+
+def _build_up(rec, thickness: float, ctx: IfcContext):
+    """``[(thickness [m], material name, layer category)]`` of an element's
+    material build-up: the layers of a layer set, or one layer of the whole
+    thickness for a single material; None when nothing is associated."""
+    mat = rec.material
+    if mat is None:
+        return None
+    if mat.is_a("IfcMaterialLayerSetUsage"):
+        mat = mat.ForLayerSet
+    if mat.is_a("IfcMaterialLayerSet"):
+        return [(float(lay.LayerThickness) * ctx.length_scale,
+                 (lay.Material.Name or "") if lay.Material else "",
+                 getattr(lay, "Category", None) or "") for lay in mat.MaterialLayers]
+    if mat.is_a("IfcMaterial"):
+        return [(thickness, mat.Name or "", "")]
+    return None
+
+
+def _describe(layers) -> str:
+    return " + ".join(f"{t * 1000:g} mm {name or '?'}" for t, name, _ in layers)
+
+
+def _wall_signals(rec, recs, clouds, feet, ctx: IfcContext):
+    """(build-up signal, code-minimum signal) of a wall: an evidence string
+    for each signal that marks it non-load-bearing, else None."""
+    from shapely.geometry import LineString, MultiPoint
+    from ..assign.material_library import guess_family
+
+    v = clouds[rec.guid]
+    rect = MultiPoint([tuple(p) for p in v[:, :2]]).minimum_rotated_rectangle
+    if rect.geom_type != "Polygon":
+        return None, None
+    c = list(rect.exterior.coords)[:4]
+    e1, e2 = LineString(c[:2]).length, LineString(c[1:3]).length
+    t, length = min(e1, e2), max(e1, e2)
+    ends = ((c[0], c[3]), (c[1], c[2])) if e1 >= e2 else ((c[0], c[1]), (c[3], c[2]))
+    trace = LineString([((p[0] + q[0]) / 2, (p[1] + q[1]) / 2) for p, q in ends])
+    z_lo, z_hi = float(v[:, 2].min()), float(v[:, 2].max())
+
+    build = None
+    layers = _build_up(rec, t, ctx)
+    if layers:
+        core = sum(th for th, name, cat in layers
+                   if "loadbearing" in cat.lower().replace(" ", "").replace("_", "")
+                   or not (guess_family(name) in NONSTRUCTURAL_FAMILIES
+                           or (guess_family(name) == "steel" and th < SHEET_STEEL_MAX)))
+        if core <= 0.0:
+            build = f"no load-bearing layer in its build-up ({_describe(layers)})"
+
+    # lateral supports: columns / walls / floors in contact with the wall
+    u_st, z_st = {0.0, length}, {z_lo, z_hi}
+    for o in recs:
+        ov = clouds.get(o.guid)
+        if o.guid == rec.guid or ov is None or feet[o.guid].distance(rect) > CONTACT_TOL:
+            continue
+        oz_lo, oz_hi = float(ov[:, 2].min()), float(ov[:, 2].max())
+        if o.ifc_class in ("IfcColumn", "IfcWall") and oz_lo < z_hi and oz_hi > z_lo:
+            u_st.add(min(max(trace.project(feet[o.guid].centroid), 0.0), length))
+        elif o.ifc_class in ("IfcSlab", "IfcBeam", "IfcMember") and z_lo < oz_hi and oz_lo < z_hi:
+            z_st.add(min(max((oz_lo + oz_hi) / 2.0, z_lo), z_hi))
+    l_u = max(hi - lo for lo, hi in zip(sorted(u_st), sorted(u_st)[1:]))
+    h_u = max(hi - lo for lo, hi in zip(sorted(z_st), sorted(z_st)[1:]))
+    t_req = max(BEARING_WALL_T_MIN, min(l_u, h_u) / BEARING_WALL_SLENDERNESS)
+    code = None
+    if t < t_req:
+        code = (f"{t * 1000:.0f} mm thick, below the ACI 318 bearing-wall minimum "
+                f"{t_req * 1000:.0f} mm (unsupported height {h_u:.2f} m, length {l_u:.2f} m)")
+    return build, code
+
+
+def _deck_signals(rec, recs, clouds, ctx: IfcContext):
+    """(build-up signal, support signal) of a slab / roof: metal-only body,
+    and framing members directly beneath carrying it everywhere."""
+    import numpy as np
+    from shapely.geometry import MultiPoint
+    from shapely.ops import unary_union
+    from ..assign.material_library import guess_family
+
+    v = clouds[rec.guid]
+    centre = v.mean(axis=0)
+    _, _, vt = np.linalg.svd(v - centre, full_matrices=False)
+    n = vt[2] if vt[2][2] >= 0 else -vt[2]
+    if n[2] < 0.5:
+        return None, None                           # not a floor / roof plate
+    e1, e2 = vt[0], np.cross(n, vt[0])
+    s = (v - centre) @ n
+    t, bottom = float(np.ptp(s)), float(s.min())
+
+    build = None
+    layers = _build_up(rec, t, ctx)
+    body = [f for f in (guess_family(name) for _, name, _ in layers or [])
+            if f not in NONSTRUCTURAL_FAMILIES]
+    if body and all(f in ("steel", "aluminum") for f in body):
+        build = f"metal-only build-up ({_describe(layers)}), no concrete / masonry / timber body"
+
+    outline = MultiPoint([((p - centre) @ e1, (p - centre) @ e2) for p in v]).convex_hull
+    carried = []
+    for o in recs:
+        ov = clouds.get(o.guid)
+        if o.ifc_class not in ("IfcBeam", "IfcMember") or ov is None:
+            continue
+        if abs(float(((ov - centre) @ n).max()) - bottom) > CONTACT_TOL:
+            continue                                # top not at the underside
+        strip = MultiPoint([((p - centre) @ e1, (p - centre) @ e2) for p in ov]).convex_hull
+        if strip.intersects(outline):
+            carried.append(strip.buffer(DECK_SUPPORT_SPACING / 2.0))
+    support = None
+    if carried and outline.area > 0:
+        covered = unary_union(carried).intersection(outline).area / outline.area
+        if covered >= 0.95:
+            support = (f"carried everywhere by {len(carried)} framing member(s) directly "
+                       f"beneath (spacing <= {DECK_SUPPORT_SPACING:g} m)")
+    return build, support
+
+
+def _cloud(rec, ctx: IfcContext):
+    """Global body vertex cloud [m] of a product (all encodings), or None."""
+    import numpy as np
+    from ..geometry.revolution import vertex_cloud
+
+    parts = []
+    for ri in rec.body_items:
+        try:
+            parts.append(vertex_cloud(ri.item, ri.matrix, ctx.length_scale)[0])
+        except Exception:
+            continue
+    parts = [p for p in parts if len(p)]
+    return np.vstack(parts) if parts else None
+
+
+def _z_range(rec, ctx: IfcContext):
+    """``(z_min, z_max)`` [m] of a product body in any encoding, or None."""
+    from ..geometry.revolution import vertex_cloud
+
+    zs = []
+    for ri in rec.body_items:
+        try:
+            verts, _ = vertex_cloud(ri.item, ri.matrix, ctx.length_scale)
+        except Exception:
+            continue
+        if len(verts):
+            zs += [float(verts[:, 2].min()), float(verts[:, 2].max())]
+    return (min(zs), max(zs)) if zs else None
+
+
+def _column_feet(recs, ctx: IfcContext):
+    """``(guid, lowest axis point)`` of every column: extrusion axis, else the
+    Axis representation."""
+    from ..geometry.axes import axis_rep_endpoints
+
+    feet = []
+    for r in recs:
+        if r.ifc_class != "IfcColumn":
+            continue
+        pts = _body_endpoints(ctx, r) or list(axis_rep_endpoints(r.axis_items,
+                                                                 ctx.length_scale) or [])
+        if pts:
+            feet.append((r.guid, min(pts, key=lambda p: p[2])))
+    return feet
+
+
+def _plate_seats(rec, feet, ctx: IfcContext):
+    """Column feet ``(guid, point)`` that stand on a plate: the plate is thin
+    and horizontal, the foot lies on its plan outline between its faces
+    (within ``BASE_PLATE_SEAT``) and the whole plate is local to that column
+    (within ``BASE_PLATE_REACH`` of its axis)."""
+    from shapely.geometry import Point, Polygon
+
+    from ..geometry.swept import plate_from_extrusion
+
+    out = []
+    for ri in rec.body_items:
+        if not ri.item.is_a("IfcExtrudedAreaSolid"):
+            continue
+        try:
+            pg = plate_from_extrusion(ri.item, ri.matrix, ctx.length_scale)
+        except Exception:
+            continue
+        if abs(pg.normal[2]) < 0.99 or len(pg.loop) < 3:
+            continue
+        mid = sum(p[2] for p in pg.loop) / len(pg.loop)
+        lo, hi = mid - pg.thickness / 2.0, mid + pg.thickness / 2.0
+        outline = Polygon([(p[0], p[1]) for p in pg.loop]).buffer(BASE_PLATE_SEAT)
+        for guid, (x, y, z) in feet:
+            if (lo - BASE_PLATE_SEAT <= z <= hi + BASE_PLATE_SEAT
+                    and outline.contains(Point(x, y))
+                    and all(((p[0] - x) ** 2 + (p[1] - y) ** 2) ** 0.5 <= BASE_PLATE_REACH
+                            for p in pg.loop)):
+                out.append((guid, (x, y, z)))
+    return out
 
 
 def _split_equipment_racks(recs, shell_forms, ctx: IfcContext):

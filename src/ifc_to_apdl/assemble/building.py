@@ -16,8 +16,10 @@ formalized with a planar arrangement instead of ad-hoc rules):
      compensated by SECOFFSET carried on the section
   3c. framing-plane reconciliation: a secondary beam whose end lies on a
      crossing beam within its depth envelope (flush top-of-steel or bearing
-     framing with no slab to unite the planes) moves into the supporting
-     beam's analytical plane, SECOFFSET keeping its centroid in place
+     framing with no slab to unite the planes), or which rests on top of a
+     crossing beam between its ends (continuous purlins over truss chords),
+     moves into the supporting beam's analytical plane, SECOFFSET keeping
+     its centroid in place
   3b. wall vertical extents reconciled to slab planes: tops/bases within the
      slab thickness of a level (Revit level-to-level walls, walls to the
      soffit) land ON the slab mid-plane; per-storey walls stacked across a
@@ -28,8 +30,10 @@ formalized with a planar arrangement instead of ad-hoc rules):
      noded together; beam segments and slab bay panels emerge from the same
      linework, so shared keypoints/lines are guaranteed. Every arrangement
      vertex on a wall trace becomes a wall partition station.
-  4a. brace workpoints to column axes / beam planes; crossing or interrupted
-     diagonals (X-bracing) noded at their common point
+  4a. brace workpoints to column axes / beam planes (an end on a beam's top
+     or bottom face, e.g. a truss web member cut to the chord face, lands on
+     the chord axis); crossing or interrupted diagonals (X-bracing) noded at
+     their common point
   5. walls partitioned at storey planes, crossing framing lines, other wall
      traces, arrangement vertices and member attachment points
   5b. conformity enforcement: any pool node lying on the interior of a member
@@ -57,7 +61,7 @@ from ..config import ConversionConfig
 from ..geometry.axes import axis_rep_endpoints
 from ..geometry.profiles import parse_profile
 from ..geometry.swept import extruded_axis, plate_from_extrusion
-from ..ingest.loader import IfcContext, ProductRecord
+from ..ingest.loader import IfcContext, ProductRecord, is_footing
 from ..model.ir import AnalyticalModel, Member1D, NodePool, Provenance, Support
 from ..model.sections import (PipeSection, RectSection, Section, ShellSection,
                               TubeSection)
@@ -500,8 +504,7 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
     # -- interpretation pass --------------------------------------------------
     for guid in system.product_guids:
         rec = ctx.products[guid]
-        name_l = rec.name.lower()
-        if rec.ifc_class == "IfcFooting" or (rec.ifc_class == "IfcSlab" and "footing" in name_l):
+        if is_footing(rec):
             if config.footing_policy == "support":
                 ctx.audit.record(guid, rec.ifc_class, rec.name, AuditStatus.EXCLUDED,
                                  detail="footing idealized as rigid support (footing_policy="
@@ -750,9 +753,11 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
     #    the sum of their depths. Where no slab pulls both into one plane
     #    (bare roof framing) the two axes never meet and the secondary beam
     #    is a free body. A horizontal beam whose END lies on a crossing beam
-    #    within that beam's depth envelope frames into it: its axis moves to
-    #    the supporting beam's analytical plane, SECOFFSET keeps the centroid
-    #    at its true elevation. Iterated so girder -> beam -> joist
+    #    within that beam's depth envelope frames into it, and one resting ON
+    #    a crossing beam between its ends bears on it (continuous purlins over
+    #    truss chords): its axis moves to the supporting beam's analytical
+    #    plane, SECOFFSET keeps the centroid at its true elevation, and the
+    #    level arrangement nodes the crossings. Iterated so girder -> beam -> joist
     #    hierarchies settle from the top of the load path down. Ends inside a
     #    column footprint frame into the column (its axis spans both planes).
     slab_lifted = {id(b) for b in beams if b.lifted_offset}
@@ -790,15 +795,52 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
                     line = LineString([(ob.start[0], ob.start[1]), (ob.end[0], ob.end[1])])
                     half_w = max(getattr(ob.section, "width", 0.0), 0.05) / 2.0
                     if line.distance(p2) <= half_w + snap_tol:
-                        targets.append((float(ob.start[2]), ob.rec.name))
+                        targets.append((float(ob.start[2]), ob.rec.name, ob))
+            # bearing framing: b rests ON a crossing beam between its own ends
+            # (purlins / joists continuous over rafters, truss chords, eave
+            # beams): underside on the supporting top flange, plans crossing
+            b_line = LineString([(b.start[0], b.start[1]), (b.end[0], b.end[1])])
+            for ob in flat:
+                if ob is b or b_len < 1e-9:
+                    continue
+                o_dir = np.array([ob.end[0] - ob.start[0], ob.end[1] - ob.start[1]])
+                o_len = float(np.hypot(*o_dir))
+                if o_len < 1e-9 or \
+                        abs(float(b_dir @ o_dir)) / (b_len * o_len) > math.cos(math.radians(10.0)):
+                    continue
+                zc_o = float(ob.start[2]) + ob.lifted_offset
+                if abs((zc_b - zc_o) - (b.depth + ob.depth) / 2.0) > snap_tol:
+                    continue                            # not resting on its top
+                o_line = LineString([(ob.start[0], ob.start[1]), (ob.end[0], ob.end[1])])
+                if b_line.distance(o_line) <= snap_tol:
+                    targets.append((float(ob.start[2]), ob.rec.name, ob))
             if not targets:
                 continue
-            zs_t = [z for z, _ in targets]
+            zs_t = [z for z, _, _ in targets]
             if max(zs_t) - min(zs_t) > max(LEVEL_TOL, snap_tol):
-                b.evidence["framing"] = ("ends frame into beams on different planes "
-                                         f"z={min(zs_t):g}..{max(zs_t):g}; axis left in place")
+                # supports on different analytical planes but with FLUSH top
+                # flanges (deep girders and shallow eave beams, all top-of-
+                # steel at the roof plane): the framing group is unified on
+                # that common top-of-steel plane (the analytical convention of
+                # frame programs), every member keeping its true centroid
+                # through SECOFFSET. Slab-lifted supports cannot move.
+                sups = {id(ob): ob for _, _, ob in targets}.values()
+                tops = [float(ob.start[2]) + ob.lifted_offset + ob.depth / 2.0 for ob in sups]
+                if max(tops) - min(tops) > snap_tol or any(id(ob) in slab_lifted for ob in sups):
+                    b.evidence["framing"] = ("ends frame into beams on different planes "
+                                             f"z={min(zs_t):g}..{max(zs_t):g}; axis left in place")
+                    continue
+                z_top = round(sum(tops) / len(tops) / merge_tol) * merge_tol
+                for m in (b, *sups):
+                    zc_m = float(m.start[2]) + m.lifted_offset
+                    m.start[2] = m.end[2] = z_top
+                    m.lifted_offset = round((zc_m - z_top) / merge_tol) * merge_tol
+                    m.evidence["elevation"] = (f"axis on the common top-of-steel plane "
+                                               f"z={z_top:g} of its framing group (centroid "
+                                               f"offset {m.lifted_offset:g}, SECOFFSET compensated)")
+                moved += 1
                 continue
-            z_t, sup_name = targets[0]
+            z_t, sup_name, _ = targets[0]
             delta = z_t - z_b
             if abs(delta) <= max(LEVEL_TOL, snap_tol):
                 continue                                # already one level cluster
@@ -816,7 +858,8 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
     if n_framed:
         ctx.audit.event("geometry",
                         f"{system.name}: {n_framed} secondary beam axis move(s) into the "
-                        "analytical plane of the supporting beam with SECOFFSET "
+                        "analytical plane of the supporting beam (or the common "
+                        "top-of-steel plane of its framing group) with SECOFFSET "
                         "compensation [framing-plane reconciliation]")
 
     # -- levels: cluster beam elevations + slab mid-planes --------------------
@@ -908,22 +951,37 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
             if snapped:
                 n_reconciled += 1
                 continue
+            # an end already in a beam's plane takes that beam (rank 0);
+            # otherwise an end landing on a beam's top / bottom FACE frames
+            # into it (rank 1: truss web members cut to the chord faces sit
+            # half a chord depth off its axis), face gap within snap
             best = None
             for hb in horiz:
                 lz = hb.start[2]
                 z_orig = lz + hb.lifted_offset        # centroid before the slab lift
-                if not (abs(pt[2] - lz) <= snap_tol or abs(pt[2] - z_orig) <= snap_tol):
-                    continue
                 line = LineString([(hb.start[0], hb.start[1]), (hb.end[0], hb.end[1])])
                 d = line.distance(Point(pt[0], pt[1]))
-                if d <= snap_tol and (best is None or d < best[0]):
+                if (abs(pt[2] - lz) <= snap_tol or abs(pt[2] - z_orig) <= snap_tol) \
+                        and d <= snap_tol:
+                    key = (0, d)
+                else:
+                    half_w = max(getattr(hb.section, "width", 0.0), 0.05) / 2.0
+                    gap = abs(pt[2] - z_orig) - hb.depth / 2.0
+                    if gap > snap_tol or d > half_w + snap_tol:
+                        continue
+                    key = (1, max(gap, 0.0) + d)
+                if best is None or key < best[0]:
                     q = line.interpolate(line.project(Point(pt[0], pt[1])))
-                    best = (d, q.x, q.y, lz)
+                    best = (key, q.x, q.y, lz)
             if best is not None:
-                pt[0], pt[1], pt[2] = best[1], best[2], best[3]
-                b.evidence["workpoint"] = "brace end -> beam axis plane"
+                # the arrangement nodes the beam at its level-cluster
+                # elevation, so the end must land there too (not on the
+                # beam's own z, which may sit a millimetre off the cluster)
                 lz_key = next((z for z in level_zs
                                if abs(z - best[3]) < max(LEVEL_TOL, snap_tol)), best[3])
+                pt[0], pt[1], pt[2] = best[1], best[2], lz_key
+                b.evidence["workpoint"] = ("brace end -> beam axis plane" if best[0][0] == 0
+                                           else "member end on a chord face -> chord axis")
                 injections[lz_key].append((best[1], best[2]))
                 n_reconciled += 1
     if n_reconciled:
@@ -1233,12 +1291,21 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
         sec_id = model.add_section(c.section)
         base_z, top_z = c.base[2], c.top[2]
         attach = []
+        axis_pt = Point(c.base[0], c.base[1])
         for m in model.members:
             for nid in (m.start, m.end):
                 p = model.nodes.xyz(nid)
                 if math.hypot(p[0] - c.base[0], p[1] - c.base[1]) <= merge_tol * 10:
                     if base_z - COLUMN_REACH <= p[2] <= top_z + COLUMN_REACH:
                         attach.append(p[2])
+            # a horizontal member running THROUGH the column axis (eave strut
+            # or girder continuous over interior columns) attaches there too;
+            # the conformity pass then splits it at the column node
+            p1, p2 = model.nodes.xyz(m.start), model.nodes.xyz(m.end)
+            if (abs(p1[2] - p2[2]) < LEVEL_TOL
+                    and base_z - COLUMN_REACH <= p1[2] <= top_z + COLUMN_REACH
+                    and LineString([p1[:2], p2[:2]]).distance(axis_pt) <= merge_tol * 2):
+                attach.append(p1[2])
         # slabs bearing directly on the column (flat-slab framing): panel
         # corners at the column point are attachment elevations too
         for s2 in model.surfaces:
@@ -1284,20 +1351,27 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
 
     # -- step 6: supports ------------------------------------------------------
     if config.bcs.building == "base-fixed" and (columns or wall_base_edges):
-        # columns anchor at their own lowest base cluster; walls at their own
-        # base edges — a single global minimum would leave the frame floating
-        # when foundation walls reach deeper than the column bases
+        # columns anchor at their own lowest base cluster, plus every column
+        # whose excluded base plate the classifier found it standing on (a
+        # thicker plate can seat a column above that cluster); walls at their
+        # own base edges — a single global minimum would leave the frame
+        # floating when foundation walls reach deeper than the column bases
         col_nodes: list[int] = []
+        plated = set(system.fixed_columns)
         if columns:
             col_base_z = min(c.base[2] for c in columns)
             col_nodes = sorted({model.nodes.get((c.base[0], c.base[1], c.base[2]))
-                                for c in columns if abs(c.base[2] - col_base_z) < snap_tol})
+                                for c in columns if abs(c.base[2] - col_base_z) < snap_tol
+                                or c.rec.guid in plated})
         model.supports.append(Support(name="BASE_FIX", nodes=col_nodes,
                                       edges=wall_base_edges,
                                       source="heuristic:base-fixed"))
+        n_plated = sum(1 for c in columns if c.rec.guid in plated)
         ctx.audit.event("boundary-condition",
                         f"{system.name}: fixed base at {len(col_nodes)} column base node(s)"
                         + (f" (z={col_base_z:g})" if col_nodes else "")
+                        + (f", {n_plated} of them in place of excluded base plates"
+                           if n_plated else "")
                         + f" and {len(wall_base_edges)} wall base edge(s) "
                         "[heuristic base-fixed]", severity="warning")
     return model
