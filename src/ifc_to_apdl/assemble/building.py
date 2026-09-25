@@ -14,6 +14,10 @@ formalized with a planar arrangement instead of ad-hoc rules):
   2. snap beam endpoints to column axes / wall mid-planes (face -> axis merge)
   3. lift beam axes into the slab centroidal plane (delta = d_b/2 + t_s/2),
      compensated by SECOFFSET carried on the section
+  3c. framing-plane reconciliation: a secondary beam whose end lies on a
+     crossing beam within its depth envelope (flush top-of-steel or bearing
+     framing with no slab to unite the planes) moves into the supporting
+     beam's analytical plane, SECOFFSET keeping its centroid in place
   3b. wall vertical extents reconciled to slab planes: tops/bases within the
      slab thickness of a level (Revit level-to-level walls, walls to the
      soffit) land ON the slab mid-plane; per-storey walls stacked across a
@@ -739,6 +743,81 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
         ctx.audit.event("geometry",
                         f"{system.name}: {n_lifted} beam axes lifted into slab centroidal "
                         "planes with SECOFFSET compensation")
+
+    # -- step 3c: framing-plane reconciliation. Steel framing is detailed
+    #    top-of-steel flush (or bearing): a secondary beam's centroid sits
+    #    above/below the centroid of the girder it frames into by up to half
+    #    the sum of their depths. Where no slab pulls both into one plane
+    #    (bare roof framing) the two axes never meet and the secondary beam
+    #    is a free body. A horizontal beam whose END lies on a crossing beam
+    #    within that beam's depth envelope frames into it: its axis moves to
+    #    the supporting beam's analytical plane, SECOFFSET keeps the centroid
+    #    at its true elevation. Iterated so girder -> beam -> joist
+    #    hierarchies settle from the top of the load path down. Ends inside a
+    #    column footprint frame into the column (its axis spans both planes).
+    slab_lifted = {id(b) for b in beams if b.lifted_offset}
+    flat = [b for b in beams if abs(b.start[2] - b.end[2]) < LEVEL_TOL]
+    n_framed = 0
+    for _ in range(4):
+        moved = 0
+        for b in flat:
+            if id(b) in slab_lifted:
+                continue
+            z_b = float(b.start[2])
+            zc_b = z_b + b.lifted_offset                # true centroid elevation
+            b_dir = np.array([b.end[0] - b.start[0], b.end[1] - b.start[1]])
+            b_len = float(np.hypot(*b_dir))
+            targets = []                                # (supporting plane z, name)
+            for pt in (b.start, b.end):
+                if any(math.hypot(pt[0] - c.base[0], pt[1] - c.base[1])
+                       <= c.plan_halfwidth + snap_tol
+                       and c.base[2] - LEVEL_TOL <= zc_b <= c.top[2] + 0.5
+                       for c in columns):
+                    continue
+                p2 = Point(pt[0], pt[1])
+                for ob in flat:
+                    if ob is b:
+                        continue
+                    o_dir = np.array([ob.end[0] - ob.start[0], ob.end[1] - ob.start[1]])
+                    o_len = float(np.hypot(*o_dir))
+                    if b_len < 1e-9 or o_len < 1e-9:
+                        continue
+                    if abs(float(b_dir @ o_dir)) / (b_len * o_len) > math.cos(math.radians(10.0)):
+                        continue                        # collinear neighbour
+                    zc_o = float(ob.start[2]) + ob.lifted_offset
+                    if abs(zc_b - zc_o) > (b.depth + ob.depth) / 2.0 + snap_tol:
+                        continue                        # depth envelopes apart
+                    line = LineString([(ob.start[0], ob.start[1]), (ob.end[0], ob.end[1])])
+                    half_w = max(getattr(ob.section, "width", 0.0), 0.05) / 2.0
+                    if line.distance(p2) <= half_w + snap_tol:
+                        targets.append((float(ob.start[2]), ob.rec.name))
+            if not targets:
+                continue
+            zs_t = [z for z, _ in targets]
+            if max(zs_t) - min(zs_t) > max(LEVEL_TOL, snap_tol):
+                b.evidence["framing"] = ("ends frame into beams on different planes "
+                                         f"z={min(zs_t):g}..{max(zs_t):g}; axis left in place")
+                continue
+            z_t, sup_name = targets[0]
+            delta = z_t - z_b
+            if abs(delta) <= max(LEVEL_TOL, snap_tol):
+                continue                                # already one level cluster
+            b.start[2] = b.end[2] = z_t
+            # authoring jitter (< merge_tol) in either elevation would make
+            # every beam its own offset-section variant
+            b.lifted_offset = round((zc_b - z_t) / merge_tol) * merge_tol
+            b.evidence["elevation"] = (f"axis moved to framing plane z={z_t:g} of supporting "
+                                       f"beam '{sup_name}' (centroid offset "
+                                       f"{b.lifted_offset:g}, SECOFFSET compensated)")
+            moved += 1
+        n_framed += moved
+        if not moved:
+            break
+    if n_framed:
+        ctx.audit.event("geometry",
+                        f"{system.name}: {n_framed} secondary beam axis move(s) into the "
+                        "analytical plane of the supporting beam with SECOFFSET "
+                        "compensation [framing-plane reconciliation]")
 
     # -- levels: cluster beam elevations + slab mid-planes --------------------
     level_zs: list[float] = []

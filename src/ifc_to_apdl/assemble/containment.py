@@ -13,8 +13,7 @@ from __future__ import annotations
 from ..assign.materials import MaterialResolver
 from ..classify.systems import SystemRecord
 from ..config import ConversionConfig
-from ..geometry.swept import cylinder_params, dome_params
-from ..geometry.tessellated import mesh_from_faceset, revolution_params
+from ..geometry.revolution import revolution_from_item
 from ..ingest.loader import IfcContext
 from ..model.ir import AnalyticalModel, NodePool, Provenance, Support, Volume3D
 from ..report.audit import AuditStatus
@@ -34,31 +33,17 @@ def assemble_containment(ctx: IfcContext, system: SystemRecord,
         mat = resolver.resolve(rec, "containment (nuclear)", "solid")
         mat_id = model.add_material(mat)
 
+        # one dispatch for every encoding (parametric, CSG, tessellated,
+        # B-rep) - the same one that classified the product as a shell
         params = None
-        detail = ""
+        detail = "no body items"
         for ri in rec.body_items:
             try:
-                if ri.item.is_a("IfcExtrudedAreaSolid"):
-                    params = cylinder_params(ri.item, ri.matrix, ctx.length_scale)
-                    detail = "extruded circular profile -> cylinder primitive"
-                elif ri.item.is_a("IfcRevolvedAreaSolid"):
-                    params = dome_params(ri.item, ri.matrix, ctx.length_scale, ctx.angle_scale)
-                    detail = "revolved annular profile -> spherical shell"
-                elif ri.item.is_a("IfcBooleanResult"):
-                    params = dome_params(ri.item, ri.matrix, ctx.length_scale, ctx.angle_scale)
-                    detail = "CSG sphere boolean -> spherical shell"
-                elif ri.item.is_a("IfcTriangulatedFaceSet"):
-                    verts, faces = mesh_from_faceset(ri.item, ctx.length_scale, ri.matrix)
-                    params = revolution_params(verts, faces)
-                    if params is None:
-                        raise ValueError("tessellated body is not a vertical body of "
-                                         "revolution (cylinder / disc / hemispherical shell)")
-                    detail = (f"tessellated body of revolution ({len(verts)} vertices) "
-                              f"-> {params.kind}")
+                params, _, detail = revolution_from_item(ri.item, ri.matrix, ctx.length_scale,
+                                                         ctx.angle_scale)
+                break
             except ValueError as exc:
                 detail = str(exc)
-            if params is not None:
-                break
 
         if params is None:
             ctx.audit.record(guid, rec.ifc_class, rec.name, AuditStatus.UNHANDLED,
