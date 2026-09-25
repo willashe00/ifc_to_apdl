@@ -98,6 +98,8 @@ def verify_deck(deck_path: str | Path, model: AnalyticalModel,
                 keep_run_dir: bool = False) -> VerificationReport:
     from ansys.mapdl.core import launch_mapdl
 
+    # MAPDL resolves /INPUT against its own run directory, not the caller's CWD
+    deck_path = Path(deck_path).resolve()
     report = VerificationReport(deck=str(deck_path))
     temp_root = None
     if run_dir is None:
