@@ -173,6 +173,8 @@ def cylinder_params(solid, matrix: np.ndarray, length_scale: float) -> SolidPara
     depth = float(solid.Depth) * length_scale
     base = apply(frame, apply(prof.position, (0.0, 0.0, 0.0)))
     d = apply_dir(frame, tuple(np.array(solid.ExtrudedDirection.DirectionRatios, dtype=float)))
+    if abs(d[2]) < 0.999:
+        raise ValueError("cylinder interpretation requires a vertical extrusion")
     z0, z1 = base[2], base[2] + d[2] * depth
     if prof.kind == "circle":
         r_out, r_in = prof.dims["r"], 0.0
@@ -192,25 +194,31 @@ def dome_params(solid, matrix: np.ndarray, length_scale: float,
                 angle_scale: float) -> SolidParams:
     """Spherical-shell dome from either encoding.
 
-    (a) IfcBooleanResult of two spheres (manuscript CSG form);
+    (a) IfcBooleanResult of two concentric spheres (manuscript CSG form),
+        at any nesting of the Boolean tree; the sphere centre is placed
+        through the object placement like every other body;
     (b) IfcRevolvedAreaSolid of an annular-arc profile revolved 2*pi
         (form observed in the containment fixture).
     """
     if solid.is_a("IfcBooleanResult"):
-        first = solid.FirstOperand
-        r_out = float(first.FirstOperand.Radius) * length_scale
-        r_in = float(first.SecondOperand.Radius) * length_scale
-        cz = float(first.FirstOperand.Position.Location.Coordinates[2]) * length_scale
+        spheres = _csg_spheres(solid, length_scale)
+        if len(spheres) < 2:
+            raise ValueError("CSG dome needs an outer and an inner sphere operand")
+        (r_out, c_out), (r_in, c_in) = (max(spheres, key=lambda s: s[0]),
+                                        min(spheres, key=lambda s: s[0]))
+        if math.dist(c_out, c_in) > 1e-6 * r_out:
+            raise ValueError("CSG dome spheres are not concentric")
+        cx, cy, cz = apply(matrix, c_out)
         return SolidParams("spherical_shell",
                            {"r_outer": r_out, "r_inner": r_in, "cz": cz,
-                            "cx": 0.0, "cy": 0.0, "hemisphere": 1.0})
+                            "cx": cx, "cy": cy, "hemisphere": 1.0})
 
     if solid.is_a("IfcRevolvedAreaSolid"):
         frame = _solid_frame(solid, matrix, length_scale)
         radii: list[float] = []
         centers: list[tuple[float, float]] = []
-        outer = solid.SweptArea.OuterCurve
-        segments = outer.Segments if outer.is_a("IfcCompositeCurve") else []
+        outer = getattr(solid.SweptArea, "OuterCurve", None)    # None: parameterized profile
+        segments = outer.Segments if outer is not None and outer.is_a("IfcCompositeCurve") else []
         for seg in segments:
             pc = seg.ParentCurve
             if pc.is_a("IfcTrimmedCurve") and pc.BasisCurve.is_a("IfcCircle"):
@@ -232,3 +240,17 @@ def dome_params(solid, matrix: np.ndarray, length_scale: float,
                             "cy": base[1], "hemisphere": 1.0})
 
     raise ValueError(f"unsupported dome encoding {solid.is_a()}")
+
+
+def _csg_spheres(node, length_scale: float) -> list[tuple[float, Vec3]]:
+    """(radius [m], centre in the object frame [m]) of every IfcSphere operand
+    in a Boolean tree."""
+    if node.is_a("IfcCsgSolid"):
+        return _csg_spheres(node.TreeRootExpression, length_scale)
+    if node.is_a("IfcBooleanResult"):
+        return (_csg_spheres(node.FirstOperand, length_scale)
+                + _csg_spheres(node.SecondOperand, length_scale))
+    if node.is_a("IfcSphere"):
+        centre = apply(axis2placement3d(node.Position, length_scale), (0.0, 0.0, 0.0))
+        return [(float(node.Radius) * length_scale, centre)]
+    return []

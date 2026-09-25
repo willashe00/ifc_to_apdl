@@ -129,29 +129,37 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
     b_idx = c_idx = 0
     for bldg, recs in sorted(by_building.items()):
         classes = {r.ifc_class for r in recs}
-        has_framing = bool(classes & {"IfcBeam", "IfcColumn"})
 
         # containment evidence: products whose body is a vertical body of
-        # revolution (parametric or tessellated) form the shell candidate set;
-        # framing inside a containment (equipment support racks) stays a
-        # separate building system
-        shells = [r for r in recs if r.ifc_class not in ("IfcBeam", "IfcColumn", "IfcMember")
-                  and _revolution_body(r, ctx)]
+        # revolution form the shell candidate set. Evidence is scored on the
+        # RECOVERED form (wall cylinder, dome), never on the representation
+        # type, so parametric, CSG and tessellated encodings of one structure
+        # score alike. Equipment support racks are not structural framing and
+        # are set aside before the framing test; any real frame inside a
+        # containment stays a separate building system
+        forms = {}
+        for r in recs:
+            if r.ifc_class not in FRAMING_CLASSES:
+                fit = _revolution_of(r, ctx)
+                if fit is not None:
+                    forms[r.guid] = fit
+        shells = [r for r in recs if r.guid in forms]
+        rest = [r for r in recs if r.guid not in forms]
+        racks, frame = _split_equipment_racks(rest, [f.params for f in forms.values()], ctx)
+
         score, why = 0, []
-        if not has_framing:
-            score += 1; why.append("no framing classes")
-        if any(ri.item.is_a("IfcRevolvedAreaSolid") or ri.item.is_a("IfcBooleanResult")
-               for r in shells for ri in r.body_items):
-            score += 1; why.append("revolved/CSG body geometry")
-        if any(ri.item.is_a("IfcExtrudedAreaSolid")
-               and ri.item.SweptArea.is_a() in ("IfcCircleProfileDef", "IfcCircleHollowProfileDef")
-               for r in shells for ri in r.body_items):
-            score += 1; why.append("circular solid profiles")
-        if any(ri.item.is_a() in ("IfcTriangulatedFaceSet", "IfcPolygonalFaceSet")
-               for r in shells for ri in r.body_items):
-            score += 1; why.append("tessellated bodies of revolution")
-        names = " ".join(r.name.lower() for r in shells)
-        if any(tok in names for tok in ("containment", "dome", "basemat", "cylindrical")):
+        if not any(r.ifc_class in FRAMING_CLASSES for r in frame):
+            score += 1
+            why.append("no framing classes" + (" besides equipment support racks" if racks else ""))
+        walls = sorted({f.encoding for f in forms.values() if f.params.kind == "cylinder"
+                        and f.params.params.get("r_inner", 0.0) > 0})
+        if walls:
+            score += 1; why.append(f"cylindrical wall shell [{'; '.join(walls)}]")
+        domes = sorted({f.encoding for f in forms.values() if f.params.kind == "spherical_shell"})
+        if domes:
+            score += 1; why.append(f"spherical dome shell [{'; '.join(domes)}]")
+        declared = " ".join([r.name for r in shells] + _building_labels(ctx, bldg)).lower()
+        if any(tok in declared for tok in CONTAINMENT_TOKENS):
             score += 1; why.append("containment naming")
 
         if shells and score >= 2:
@@ -159,8 +167,6 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
             systems.append(SystemRecord(name=f"containment-{c_idx}", domain="containment",
                                         product_guids=[r.guid for r in shells],
                                         evidence=why))
-            rest = [r for r in recs if r not in shells]
-            racks, frame = _split_equipment_racks(rest, shells, ctx)
             for r in racks:
                 ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
                                  detail="equipment support rack inside the containment "
@@ -196,11 +202,18 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
     return systems
 
 
+#: linear framing classes (never containment shells)
+FRAMING_CLASSES = ("IfcBeam", "IfcColumn", "IfcMember")
+
 #: name tokens marking framing that only carries equipment (not a structure)
 RACK_TOKENS = ("support rack", "equipment support", "support frame", "skid", "pipe rack")
 
+#: declared containment semantics, matched in shell product names and in the
+#: containing IfcBuilding's Name / LongName / ObjectType / Description
+CONTAINMENT_TOKENS = ("containment", "dome", "basemat", "cylindrical")
 
-def _split_equipment_racks(recs, shells, ctx: IfcContext):
+
+def _split_equipment_racks(recs, shell_forms, ctx: IfcContext):
     """Separate equipment-support racks from real structural framing.
 
     A rack is framing (beams / columns / members) that either
@@ -209,15 +222,13 @@ def _split_equipment_racks(recs, shells, ctx: IfcContext):
         framing set carries no slab, wall or plate of its own - a bare
         beam/column cage inside the containment is an equipment support,
         not part of the analysed structure.
+    ``shell_forms`` are the recovered ``SolidParams`` of the shells.
     Returns ``(racks, frame)``.
     """
-    framing = {"IfcBeam", "IfcColumn", "IfcMember"}
+    framing = set(FRAMING_CLASSES)
     bare = not any(r.ifc_class not in framing for r in recs)
-    footprints = []
-    for sh in shells:
-        prm = _revolution_params_of(sh, ctx)
-        if prm is not None and prm.kind == "cylinder":
-            footprints.append((prm.params["cx"], prm.params["cy"], prm.params["r_outer"]))
+    footprints = [(p.params["cx"], p.params["cy"], p.params["r_outer"])
+                  for p in shell_forms if p.kind == "cylinder"]
     racks, frame = [], []
     for r in recs:
         name = (r.name or "").lower()
@@ -234,48 +245,27 @@ def _split_equipment_racks(recs, shells, ctx: IfcContext):
     return racks, frame
 
 
-def _revolution_params_of(rec, ctx: IfcContext):
-    """SolidParams of a product body of revolution, or None."""
-    from ..geometry.swept import cylinder_params, dome_params
+def _revolution_of(rec, ctx: IfcContext):
+    """``RevolutionFit`` of the first body item that is a vertical body of
+    revolution in any encoding, or None."""
+    from ..geometry.revolution import revolution_from_item
     for ri in rec.body_items:
-        item = ri.item
         try:
-            if item.is_a("IfcExtrudedAreaSolid") and item.SweptArea.is_a() in (
-                    "IfcCircleProfileDef", "IfcCircleHollowProfileDef"):
-                return cylinder_params(item, ri.matrix, ctx.length_scale)
-            if item.is_a("IfcRevolvedAreaSolid") or item.is_a("IfcBooleanResult"):
-                return dome_params(item, ri.matrix, ctx.length_scale, ctx.angle_scale)
-            if item.is_a("IfcTriangulatedFaceSet"):
-                from ..geometry.tessellated import mesh_from_faceset, revolution_params
-                verts, faces = mesh_from_faceset(item, ctx.length_scale, ri.matrix)
-                prm = revolution_params(verts, faces)
-                if prm is not None:
-                    return prm
+            return revolution_from_item(ri.item, ri.matrix, ctx.length_scale, ctx.angle_scale)
         except Exception:
             continue
     return None
 
 
-def _revolution_body(rec, ctx: IfcContext) -> bool:
-    """True when a product body is a vertical body of revolution: revolved or
-    CSG-sphere solid, circular extrusion, or a tessellation that
-    ``revolution_params`` recognises (cylinder, disc, hemispherical shell)."""
-    for ri in rec.body_items:
-        item = ri.item
-        if item.is_a("IfcRevolvedAreaSolid") or item.is_a("IfcBooleanResult"):
-            return True
-        if item.is_a("IfcExtrudedAreaSolid") and item.SweptArea.is_a() in (
-                "IfcCircleProfileDef", "IfcCircleHollowProfileDef"):
-            return True
-        if item.is_a("IfcTriangulatedFaceSet"):
-            try:
-                from ..geometry.tessellated import mesh_from_faceset, revolution_params
-                verts, faces = mesh_from_faceset(item, ctx.length_scale, ri.matrix)
-                if revolution_params(verts, faces) is not None:
-                    return True
-            except Exception:
-                continue
-    return False
+def _building_labels(ctx: IfcContext, building_guid: str) -> list[str]:
+    """Declared labels of an IfcBuilding (Name, LongName, ObjectType,
+    Description) - e.g. ObjectType 'REACTOR_CONTAINMENT'."""
+    try:
+        b = ctx.model.by_guid(building_guid)
+    except Exception:
+        return []
+    return [str(v) for v in (getattr(b, a, None) for a in
+                             ("Name", "LongName", "ObjectType", "Description")) if v]
 
 
 def _body_endpoints(ctx: IfcContext, rec) -> list[tuple[float, float, float]]:
