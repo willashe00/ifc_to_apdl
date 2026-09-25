@@ -75,7 +75,7 @@ def revolution_from_item(item, matrix: np.ndarray, length_scale: float,
                                  f"{base.SweptArea.is_a()} is not a body of revolution")
 
     # -- 2./3. computational fit on the vertex cloud ----------------------
-    verts, how = _vertex_cloud(item, matrix, length_scale)
+    verts, how = vertex_cloud(item, matrix, length_scale)
     prm = revolution_params(verts)
     if prm is None:
         raise ValueError(f"{how} is not a vertical body of revolution "
@@ -91,9 +91,16 @@ def _boolean_base(item):
     return item
 
 
-def _vertex_cloud(item, matrix: np.ndarray, length_scale: float) -> tuple[np.ndarray, str]:
+def vertex_cloud(item, matrix: np.ndarray, length_scale: float) -> tuple[np.ndarray, str]:
     """Global vertex cloud [m] of a body item and a label of how it was
-    obtained. Fitting a body of revolution needs vertices only (no faces)."""
+    obtained. Fitting a body of revolution or bounding an element's extent
+    needs vertices only (no faces)."""
+    prof = None
+    if item.is_a("IfcExtrudedAreaSolid"):
+        try:
+            prof = parse_profile(item.SweptArea, length_scale)
+        except ValueError:
+            prof = None
     if item.is_a("IfcTriangulatedFaceSet") or item.is_a("IfcPolygonalFaceSet"):
         local = np.array(item.Coordinates.CoordList, dtype=float) * length_scale
         how = "tessellated face set"
@@ -103,10 +110,9 @@ def _vertex_cloud(item, matrix: np.ndarray, length_scale: float) -> tuple[np.nda
                for bound in face.Bounds for p in bound.Bound.Polygon}
         local = np.array(list(pts.values()), dtype=float) * length_scale
         how = "faceted B-rep"
-    elif item.is_a("IfcExtrudedAreaSolid"):
-        # arbitrary outline (e.g. an annulus of arc segments): the sampled
-        # outline and voids at both ends of the extrusion
-        prof = parse_profile(item.SweptArea, length_scale)
+    elif prof is not None and prof.poly:
+        # polygonal outline (rectangle, or an annulus of arc segments): the
+        # sampled outline and voids at both ends of the extrusion
         ring = [apply(prof.position, p) for p in [*prof.poly, *(q for h in prof.holes for q in h)]]
         d = np.array(item.ExtrudedDirection.DirectionRatios, dtype=float)
         d = d / np.linalg.norm(d) * float(item.Depth) * length_scale

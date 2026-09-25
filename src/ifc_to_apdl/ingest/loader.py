@@ -75,6 +75,14 @@ def is_hanger(rec: "ProductRecord") -> bool:
     return "hanger" in tokens
 
 
+def is_footing(rec: "ProductRecord") -> bool:
+    """Foundation elements governed by ``ConversionConfig.footing_policy``:
+    IfcFooting, or slabs named as footings (Revit exports pad footings as
+    IfcSlab BASESLAB 'M_Footing-...')."""
+    return rec.ifc_class == "IfcFooting" or (rec.ifc_class == "IfcSlab"
+                                             and "footing" in rec.name.lower())
+
+
 @dataclass
 class IfcContext:
     path: str
