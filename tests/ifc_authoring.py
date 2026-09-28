@@ -71,6 +71,18 @@ class Author:
             float(np.linalg.norm(p1 - p0)))
         return self.product(cls, name, p0, [solid], "SweptSolid", self.steel)
 
+    def i_beam(self, name, p0, p1, d=0.4, bf=0.2, tw=0.01, tf=0.015):
+        """IfcBeam of an I profile (depth vertical) along a horizontal axis."""
+        f = self.f
+        p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
+        axis = (p1 - p0) / np.linalg.norm(p1 - p0)
+        ref = (1.0, 0.0, 0.0) if abs(axis[0]) < 0.9 else (0.0, 1.0, 0.0)
+        solid = f.createIfcExtrudedAreaSolid(
+            f.createIfcIShapeProfileDef("AREA", None, None, bf, d, tw, tf, None),
+            self.a2p((0, 0, 0), tuple(axis), ref), f.createIfcDirection((0.0, 0.0, 1.0)),
+            float(np.linalg.norm(p1 - p0)))
+        return self.product("IfcBeam", name, p0, [solid], "SweptSolid", self.steel)
+
     def rack(self, x0, y0):
         """Named 4-column equipment support rack (2.5 m square, 4 m tall)."""
         corners = [(x0, y0), (x0 + 2.5, y0), (x0 + 2.5, y0 + 2.5), (x0, y0 + 2.5)]
@@ -128,16 +140,56 @@ class Author:
         e.ObjectPlacement.RelativePlacement.Axis = f.createIfcDirection((0.0, 0.0, 1.0))
         return e
 
-    def plate(self, name, centre, x, y, t, predefined_type=None, assembly=None):
+    def plate(self, name, centre, x, y, t, predefined_type=None, assembly=None, fasteners=0):
         """Horizontal rectangular IfcPlate (x by y, thickness t) whose bottom
         face is centred on ``centre``; optionally typed through an IfcPlateType
-        and/or aggregated into a named IfcElementAssembly."""
+        and/or aggregated into a named IfcElementAssembly (with ``fasteners``
+        bolts)."""
         f = self.f
         solid = f.createIfcExtrudedAreaSolid(
             f.createIfcRectangleProfileDef("AREA", None, None, x, y),
             self.a2p((0, 0, 0)), f.createIfcDirection((0.0, 0.0, 1.0)), t)
         e = self.product("IfcPlate", name, centre, [solid], "SweptSolid", self.steel,
                          contained=assembly is None)
+        return self._plate_links(e, centre, predefined_type, assembly, fasteners)
+
+    def web_plate(self, name, centre, along, x, y, t, plan_outline=False,
+                  predefined_type=None, assembly=None, fasteners=0):
+        """Upright rectangular IfcPlate centred on ``centre``: ``x`` along the
+        horizontal unit vector ``along``, ``y`` high, ``t`` thick across. As a
+        rectangle extruded through the thickness, or (``plan_outline``) as the
+        same solid written as its plan outline extruded up the height."""
+        f = self.f
+        along = np.asarray(along, float)
+        across = np.cross(along, (0.0, 0.0, 1.0))
+        if plan_outline:
+            pts = [(-x / 2, -t / 2), (x / 2, -t / 2), (x / 2, t / 2), (-x / 2, t / 2), (-x / 2, -t / 2)]
+            profile = f.createIfcArbitraryClosedProfileDef("AREA", None, f.createIfcPolyline(
+                [f.createIfcCartesianPoint(p) for p in pts]))
+            solid = f.createIfcExtrudedAreaSolid(
+                profile, self.a2p((0.0, 0.0, -y / 2), (0.0, 0.0, 1.0), tuple(along)),
+                f.createIfcDirection((0.0, 0.0, 1.0)), y)
+        else:
+            solid = f.createIfcExtrudedAreaSolid(
+                f.createIfcRectangleProfileDef("AREA", None, None, x, y),
+                self.a2p(tuple(-across * t / 2), tuple(across), tuple(along)),
+                f.createIfcDirection((0.0, 0.0, 1.0)), t)
+        e = self.product("IfcPlate", name, centre, [solid], "SweptSolid", self.steel,
+                         contained=assembly is None)
+        return self._plate_links(e, centre, predefined_type, assembly, fasteners)
+
+    def fastener(self, name, centre, contained=True):
+        """IfcMechanicalFastener (bolt) without a body."""
+        f = self.f
+        e = f.create_entity("IfcMechanicalFastener", GlobalId=guid.new(), Name=name,
+                            PredefinedType="BOLT",
+                            ObjectPlacement=f.createIfcLocalPlacement(None, self.a2p(centre)))
+        if contained:
+            self.products.append(e)
+        return e
+
+    def _plate_links(self, e, centre, predefined_type, assembly, fasteners):
+        f = self.f
         if predefined_type:
             ptype = f.create_entity("IfcPlateType", GlobalId=guid.new(), Name="Plate type",
                                     PredefinedType=predefined_type)
@@ -145,6 +197,8 @@ class Author:
         if assembly:
             asm = f.create_entity("IfcElementAssembly", GlobalId=guid.new(), Name=assembly,
                                   ObjectPlacement=f.createIfcLocalPlacement(None, self.a2p(centre)))
-            f.createIfcRelAggregates(guid.new(), None, None, None, asm, (e,))
+            bolts = [self.fastener(f"{assembly} - Bolt {i}", centre, contained=False)
+                     for i in range(1, fasteners + 1)]
+            f.createIfcRelAggregates(guid.new(), None, None, None, asm, (e, *bolts))
             self.products.append(asm)
         return e
