@@ -113,14 +113,6 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
         for s in piping_systems:
             s.product_guids.sort()
 
-    # -- accessory hardware that joined no piping system: outside scope -------
-    #    (recorded so the coverage audit accounts for every ingested product)
-    for rec in ctx.products.values():
-        if rec.ifc_class in ACCESSORY_CLASSES and rec.guid not in hanger_guids:
-            ctx.audit.record(rec.guid, rec.ifc_class, rec.name, AuditStatus.EXCLUDED,
-                             detail="accessory hardware not associated with a piping "
-                                    "run — outside analytical conversion scope")
-
     # -- structural systems: grouped per IfcBuilding via E_A ------------------
     struct = [r for r in ctx.products.values()
               if r.ifc_class in STRUCTURAL_CLASSES and r.guid not in hanger_guids]
@@ -129,15 +121,35 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
         by_building.setdefault(r.building_guid or "_none", []).append(r)
 
     b_idx = c_idx = 0
+    connection_hw: set[str] = set()
     for bldg, recs in sorted(by_building.items()):
-        # column base plates are connection hardware, not frame: excluded
-        # first (a leftover plate would also defeat the bare-cage rack rule),
-        # and the columns standing on them are fixed at the foot instead
+        # column base plates and shear tabs are connection hardware, not
+        # frame: excluded first (a leftover plate would also defeat the
+        # bare-cage rack rule). The columns standing on base plates are fixed
+        # at the foot instead; beams frame directly into their supports
         plates, recs, seated = _split_base_plates(recs, ctx)
+        tabs, recs = _split_shear_tabs(recs, ctx)
         for r, why in plates:
             ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
                              detail=f"column base plate ({why}) - connection hardware; "
                                     "the column is fixed at its foot instead")
+        for r, why in tabs:
+            ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                             detail=f"shear tab ({why}) - connection hardware; the beam "
+                                    "frames directly into its support instead")
+        # their bolts, nuts and anchor bolts go with them
+        n_hw = 0
+        for kind, group in (("column base plate", plates), ("shear tab", tabs)):
+            for r, _ in group:
+                label, fasteners = _connection_fasteners(r, ctx)
+                for part in fasteners:
+                    if part.guid in hanger_guids or part.guid in connection_hw:
+                        continue
+                    connection_hw.add(part.guid)
+                    n_hw += 1
+                    ctx.audit.record(part.guid, part.ifc_class, part.name, AuditStatus.EXCLUDED,
+                                     detail=f"connection hardware of the excluded {kind} "
+                                            f"'{label}' - not converted")
         if not recs:
             continue
         n_before = len(systems)
@@ -234,8 +246,22 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
             if plates and s.domain == "building":
                 s.evidence.append(f"{len(plates)} column base plate(s) excluded, "
                                   f"{len(s.fixed_columns)} column(s) fixed at the foot")
+            if tabs and s.domain == "building":
+                s.evidence.append(f"{len(tabs)} shear tab(s) excluded")
+            if n_hw and s.domain == "building":
+                s.evidence.append(f"{n_hw} connection fastener(s) excluded with their plates")
             if ground and s.domain == "building":
                 s.evidence.append(f"{len(ground)} ground slab(s) excluded")
+
+    # -- accessory hardware that joined no piping system and belongs to no
+    #    excluded connection: outside scope (recorded so the coverage audit
+    #    accounts for every ingested product)
+    for rec in ctx.products.values():
+        if (rec.ifc_class in ACCESSORY_CLASSES and rec.guid not in hanger_guids
+                and rec.guid not in connection_hw):
+            ctx.audit.record(rec.guid, rec.ifc_class, rec.name, AuditStatus.EXCLUDED,
+                             detail="accessory hardware not associated with a piping "
+                                    "run — outside analytical conversion scope")
 
     for s in systems:
         ctx.audit.event("classification",
@@ -266,6 +292,22 @@ BASE_PLATE_SEAT = 0.025
 #: column feet within this height [m] of the lowest foot are at the support
 #: level (same reach the building assembler uses for base supports)
 SUPPORT_LEVEL_REACH = 0.5
+
+#: name tokens marking shear tabs - single-plate (US) / fin-plate (UK) beam
+#: end connections - in the plate name, ObjectType, or the name of the
+#: element assembly the plate is aggregated into
+SHEAR_TAB_TOKENS = ("shear tab", "sheartab", "shear_tab", "shear-tab",
+                    "fin plate", "finplate", "fin_plate", "fin-plate")
+#: a shear tab laps the web at a beam end: its centre lies within this
+#: distance [m] of the end (58 mm on the model (2) turbine hall)
+SHEAR_TAB_REACH = 0.3
+#: a plate is thin when its thickness is at most this fraction of its
+#: smaller in-plane side
+THIN_PLATE_RATIO = 0.2
+#: |cos| of the angle between a lapping plate's normal and the beam axis
+#: (the plate runs parallel to the web) or the vertical (the plate stands
+#: upright like the web of a gravity beam)
+LAP_PARALLEL_COS = 0.05
 
 
 def _split_base_plates(recs, ctx: IfcContext):
@@ -299,12 +341,8 @@ def _split_base_plates(recs, ctx: IfcContext):
         ptype = (ioe.get_predefined_type(r.entity) or "").upper()
         if ptype == "BASE_PLATE":
             why = "declared PredefinedType BASE_PLATE"
-        else:
-            agg = ioe.get_aggregate(r.entity)
-            labels = [r.name, getattr(r.entity, "ObjectType", None) or "",
-                      (getattr(agg, "Name", None) or "") if agg is not None else ""]
-            if any(tok in " ".join(labels).lower() for tok in BASE_PLATE_TOKENS):
-                why = "base-plate naming"
+        elif any(tok in _plate_labels(r) for tok in BASE_PLATE_TOKENS):
+            why = "base-plate naming"
         # only feet at the support level are grounded: a column on a base
         # plate higher up (e.g. on a transfer girder) bears on the frame
         on = [(g, p) for g, p in _plate_seats(r, feet, ctx)
@@ -317,6 +355,112 @@ def _split_base_plates(recs, ctx: IfcContext):
         plates.append((r, why))
         seated += [g for g, _ in on if g not in seated]
     return plates, rest, seated
+
+
+def _split_shear_tabs(recs, ctx: IfcContext):
+    """Separate shear tabs from the structural products.
+
+    A shear tab (single-plate / fin-plate connection) is a short plate fixed
+    to the support and bolted to the web at a beam end. It is connection
+    hardware: the analytical beam frames directly into its support, so the
+    plate is not converted. Evidence cascade (first hit wins):
+      * named - the plate, its ObjectType, or the element assembly it is
+        aggregated into carries a shear-tab token (``SHEAR_TAB_TOKENS``);
+      * geometric - a thin plate lapping the web of exactly one beam near
+        its end (``_lapped_beam_ends``). A plate lapping two beam ends is a
+        web splice plate - the only link between the beam pieces - and is
+        kept, like splice plates between stacked columns.
+    Declared types are not evidence: IFC 4.3 WEB_PLATE is the web of a
+    built-up box / I girder, which is primary structure, yet exporters put
+    it on shear tabs as well.
+    Returns ``(tabs, rest)`` with tabs as ``(record, evidence)`` pairs.
+    """
+    tabs, rest, beams = [], [], None
+    for r in recs:
+        if r.ifc_class != "IfcPlate":
+            rest.append(r)
+            continue
+        why = None
+        if any(tok in _plate_labels(r) for tok in SHEAR_TAB_TOKENS):
+            why = "shear-tab naming"
+        else:
+            if beams is None:       # beam bodies only once a plate needs them
+                beams = {b.guid: _cloud(b, ctx) for b in recs if b.ifc_class == "IfcBeam"}
+            hosts = _lapped_beam_ends(_cloud(r, ctx), beams)
+            if len(hosts) == 1:
+                why = (f"thin plate lapping the web at an end of beam "
+                       f"'{ctx.products[hosts[0]].name}'")
+        if why is None:
+            rest.append(r)
+        else:
+            tabs.append((r, why))
+    return tabs, rest
+
+
+def _lapped_beam_ends(v, beams) -> list[str]:
+    """GUIDs of the beams whose web a plate (vertex cloud ``v``) laps near an
+    end: the plate is thin and upright (gravity beams have vertical webs; a
+    flat plate on a flange is not a shear tab), runs parallel to the beam
+    axis, lies inside the beam's cross-section envelope (between the flange
+    tips, within the depth), touches the beam along its length and has its
+    centre within ``SHEAR_TAB_REACH`` of a beam end. ``beams`` maps GUID ->
+    vertex cloud. Only principal axes and extents of the vertex clouds are
+    used, so every body encoding of the same solid reads alike."""
+    import numpy as np
+
+    if v is None or len(v) < 4:
+        return []
+    centre = v.mean(axis=0)
+    _, _, vt = np.linalg.svd(v - centre, full_matrices=False)
+    ext = np.ptp((v - centre) @ vt.T, axis=0)      # principal extents, largest first
+    normal = vt[2]
+    if ext[2] > THIN_PLATE_RATIO * ext[1] or abs(float(normal[2])) > LAP_PARALLEL_COS:
+        return []                                  # not a thin upright plate
+    hosts = []
+    for guid, bv in beams.items():
+        if bv is None or len(bv) < 2:
+            continue
+        _, _, bt = np.linalg.svd(bv - bv.mean(axis=0), full_matrices=False)
+        a = bt[0]                                  # beam axis
+        if abs(float(normal @ a)) > LAP_PARALLEL_COS:
+            continue
+        n = normal - (normal @ a) * a              # across the web
+        n /= np.linalg.norm(n)
+        frame = np.column_stack([a, n, np.cross(a, n)])
+        (s_lo, w_lo, d_lo), (s_hi, w_hi, d_hi) = (bv @ frame).min(axis=0), (bv @ frame).max(axis=0)
+        (p_lo, _, q_lo), (p_hi, _, q_hi) = (v @ frame).min(axis=0), (v @ frame).max(axis=0)
+        s_c, w_c = float(centre @ a), float(centre @ n)
+        if (w_lo - CONTACT_TOL <= w_c <= w_hi + CONTACT_TOL
+                and d_lo - CONTACT_TOL <= q_lo and q_hi <= d_hi + CONTACT_TOL
+                and p_hi >= s_lo - CONTACT_TOL and p_lo <= s_hi + CONTACT_TOL
+                and min(abs(s_c - s_lo), abs(s_hi - s_c)) <= SHEAR_TAB_REACH):
+            hosts.append(guid)
+    return hosts
+
+
+def _plate_labels(rec) -> str:
+    """Declared labels of a plate, lower case: its name, ObjectType, and the
+    name of the element assembly it is aggregated into."""
+    import ifcopenshell.util.element as ioe
+
+    agg = ioe.get_aggregate(rec.entity)
+    return " ".join([rec.name, getattr(rec.entity, "ObjectType", None) or "",
+                     (getattr(agg, "Name", None) or "") if agg is not None else ""]).lower()
+
+
+def _connection_fasteners(rec, ctx: IfcContext):
+    """``(label, fasteners)`` of an excluded connection plate: the accessory
+    products (bolts, nuts, anchor bolts) aggregated into the same element
+    assembly, labelled by the assembly name (the plate name without one)."""
+    import ifcopenshell.util.element as ioe
+
+    agg = ioe.get_aggregate(rec.entity)
+    if agg is None:
+        return rec.name, []
+    parts = [ctx.products.get(e.GlobalId) for e in sorted(
+        ioe.get_decomposition(agg), key=lambda e: (e.Name or "", e.GlobalId))]
+    return (getattr(agg, "Name", None) or rec.name,
+            [p for p in parts if p is not None and p.ifc_class in ACCESSORY_CLASSES])
 
 
 #: tolerance [m] for a slab top face lying at the support level
