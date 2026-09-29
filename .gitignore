@@ -3,6 +3,7 @@ test_models/
 outputs/
 verification_tests/
 docs/
+paper/
 
 # MAPDL scratch (verification runs)
 *.err
