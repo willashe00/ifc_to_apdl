@@ -103,13 +103,20 @@ class Author:
                                OffsetFromReferenceLine=0.0)
 
     def pset(self, e, name, props):
-        """Property set of single values (bool -> IfcBoolean, else IfcLabel)."""
+        """Property set of single values (bool -> IfcBoolean, else IfcLabel).
+        A type object holds its sets directly in HasPropertySets, which is
+        where get_psets looks when it inherits from the type; an occurrence
+        gets one through IfcRelDefinesByProperties."""
         f = self.f
         vals = [f.createIfcPropertySingleValue(
             k, None, f.create_entity("IfcBoolean" if isinstance(v, bool) else "IfcLabel", v), None)
             for k, v in props.items()]
-        f.createIfcRelDefinesByProperties(guid.new(), None, None, None, (e,),
-                                          f.createIfcPropertySet(guid.new(), None, name, None, vals))
+        ps = f.createIfcPropertySet(guid.new(), None, name, None, vals)
+        if e.is_a("IfcTypeObject"):
+            e.HasPropertySets = tuple(e.HasPropertySets or ()) + (ps,)
+        else:
+            f.createIfcRelDefinesByProperties(guid.new(), None, None, None, (e,), ps)
+        return ps
 
     def slab(self, name, x0, y0, x1, y1, z0, t, predefined_type=None, layers=None):
         """Rectangular IfcSlab from (x0, y0) to (x1, y1), bottom face at z0."""
@@ -202,3 +209,76 @@ class Author:
             f.createIfcRelAggregates(guid.new(), None, None, None, asm, (e, *bolts))
             self.products.append(asm)
         return e
+
+    def _prism(self, cls, name, origin, dx, dy, dz, material=None):
+        """Box of (dx, dy, dz) from ``origin``: a dx-by-dy plan outline
+        extruded +Z by dz, centred on ``origin`` in plan with its underside at
+        its z. The outline is an IfcArbitraryClosedProfileDef over an
+        IfcIndexedPolyCurve, which is how Alchemy authors a panel skin - a
+        ribbed skin has no rectangular profile to author. The encoding matters
+        to a reader: plate_from_extrusion takes the smallest of the three
+        characteristic dimensions as the thickness of a *rectangle* profile,
+        but an arbitrary profile is treated as a footprint and its extrusion
+        depth as the thickness.
+
+        Not contained in the spatial structure: a panel piece belongs to its
+        panel.
+        """
+        f = self.f
+        hx, hy = dx / 2.0, dy / 2.0
+        outline = f.create_entity(
+            "IfcIndexedPolyCurve",
+            Points=f.create_entity("IfcCartesianPointList2D", CoordList=(
+                (-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy), (-hx, -hy))),
+            SelfIntersect=False)
+        solid = f.createIfcExtrudedAreaSolid(
+            f.create_entity("IfcArbitraryClosedProfileDef", ProfileType="AREA",
+                            OuterCurve=outline),
+            self.a2p((0, 0, 0)), f.createIfcDirection((0.0, 0.0, 1.0)), dz)
+        return self.product(cls, name, origin, [solid], "SweptSolid",
+                            material or self.steel, contained=False)
+
+    def panel(self, cls, name, origin, dx, dy, dz, layers, load_bearing=False):
+        """Insulated metal panel as Alchemy authors one: an IfcWall or IfcRoof
+        with no body of its own, decomposed through IfcRelAggregates into two
+        IfcPlate skins and an IfcBuildingElementPart core per inner layer.
+
+        The build-up and the LoadBearing declaration sit on the type, where
+        get_material and get_psets both find them by inheritance. ``layers``
+        is laid out along whichever edge of (dx, dy, dz) is thinnest, so a
+        wall panel (thin in y) and a roof panel (thin in z) both work.
+
+        Returns ``(container, pieces)``.
+        """
+        f = self.f
+        size = [float(dx), float(dy), float(dz)]
+        axis = min(range(3), key=lambda i: size[i])     # the thickness direction
+
+        container = f.create_entity(
+            cls, GlobalId=guid.new(), Name=name,
+            ObjectPlacement=f.createIfcLocalPlacement(None, self.a2p(origin)))
+        wall = cls == "IfcWall"
+        ptype = f.create_entity(f"{cls}Type", GlobalId=guid.new(), Name=f"{name} type",
+                                PredefinedType="ELEMENTEDWALL" if wall else "FLAT_ROOF",
+                                ElementType="INSULATEDMETALPANEL")
+        f.createIfcRelDefinesByType(guid.new(), None, None, None, (container,), ptype)
+        self.pset(ptype, "Pset_WallCommon" if wall else "Pset_RoofCommon",
+                  {"LoadBearing": load_bearing})
+        self.mat_of.setdefault(self.layer_usage(layers), []).append(ptype)
+
+        pieces, offset = [], 0.0
+        for i, (t, mat_name) in enumerate(layers):
+            at = list(origin)
+            at[axis] += offset
+            box = list(size)
+            box[axis] = t
+            role = ("Outer Skin" if i == 0 else
+                    "Inner Liner" if i == len(layers) - 1 else "Core")
+            pieces.append(self._prism(
+                "IfcPlate" if role != "Core" else "IfcBuildingElementPart",
+                f"{name} - {role}", at, *box,
+                material=None if role != "Core" else f.createIfcMaterial(mat_name, None, None)))
+            offset += t
+        f.createIfcRelAggregates(guid.new(), None, None, None, container, tuple(pieces))
+        self.products.append(container)
+        return container, pieces
