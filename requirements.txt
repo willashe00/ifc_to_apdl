@@ -1,6 +1,6 @@
 # Runtime dependencies (mirrors [project.dependencies] in pyproject.toml).
 # Install with:  pip install -r requirements.txt
-ifcopenshell>=0.8
+ifcopenshell>=0.8.5
 numpy
 networkx
 shapely>=2.0

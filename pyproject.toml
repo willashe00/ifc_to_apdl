@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Multi-system semantic graph-based conversion of IFC architectural models into preprocessing-only Mechanical APDL analytical models"
 requires-python = ">=3.11"
 dependencies = [
-    "ifcopenshell>=0.8",
+    "ifcopenshell>=0.8.5",
     "numpy",
     "networkx",
     "shapely>=2.0",

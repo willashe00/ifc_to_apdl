@@ -97,6 +97,78 @@ def test_declared_role_decides(tmp_path, decl, excluded_expected):
         assert "declared" in excluded["Wall"]
 
 
+def _panel_hall(tmp_path, name="panels.ifc", load_bearing=False, height=8.0):
+    """A hall with an insulated metal panel wall and roof, each decomposed
+    into skins and a core the way Alchemy authors them."""
+    a = _hall(height=height)
+    wall = a.panel("IfcWall", "Panel wall", (6.0, -0.25, 0.0),
+                   12.6, 0.1009, height + 0.2, IMP, load_bearing=load_bearing)
+    roof = a.panel("IfcRoof", "Panel roof", (6.0, 4.5, height + 0.2),
+                   12.6, 9.6, 0.1009, IMP, load_bearing=load_bearing)
+    ctx = load_ifc(a.save(tmp_path / name))
+    systems = classify_systems(ctx)
+    return ctx, systems, [wall, roof]
+
+
+def test_decomposed_panel_and_its_parts_excluded(tmp_path):
+    """A panel carries no body of its own: its skins and core do. Excluding
+    the panel alone leaves the pieces holding the geometry to convert as
+    structure on their own, so the parts have to inherit its role."""
+    ctx, systems, panels = _panel_hall(tmp_path)
+    excluded = {e.name: e.detail for e in ctx.audit.entries.values() if "envelope" in e.detail}
+
+    assert "declared Pset_WallCommon.LoadBearing = FALSE" in excluded["Panel wall"]
+    assert "declared Pset_RoofCommon.LoadBearing = FALSE" in excluded["Panel roof"]
+    for container, pieces in panels:
+        for skin in [p for p in pieces if p.is_a("IfcPlate")]:
+            assert f"part of '{container.Name}'" in excluded[skin.Name]
+            assert "LoadBearing = FALSE" in excluded[skin.Name]
+    converted = {g for s in systems for g in s.product_guids}
+    assert not converted & {p.GlobalId for _, pieces in panels for p in pieces}
+
+    # the foam cores never reach classification at all: IfcBuildingElementPart
+    # is in no ingested class list, so they are dropped before this point and
+    # the coverage audit does not account for them
+    cores = [p for _, pieces in panels for p in pieces if p.is_a("IfcBuildingElementPart")]
+    assert cores and not any(p.GlobalId in ctx.products for p in cores)
+
+
+def test_decomposed_load_bearing_panel_and_parts_kept(tmp_path):
+    """The inherited role follows the declaration both ways: a decomposed
+    element declared load-bearing keeps its parts in the frame."""
+    ctx, systems, panels = _panel_hall(tmp_path, "bearing.ifc", load_bearing=True)
+    assert not [e for e in ctx.audit.entries.values() if "envelope" in e.detail]
+    converted = {g for s in systems for g in s.product_guids}
+    skins = {p.GlobalId for _, pieces in panels for p in pieces if p.is_a("IfcPlate")}
+    assert skins <= converted
+
+
+def test_decomposed_panel_leaves_no_envelope_shell(tmp_path):
+    """What the deck shows. A skin is a thin plan sliver extruded by the
+    panel height, and _slab_from reads an extrusion depth as a thickness, so
+    a converted skin becomes a shell as thick as the panel is tall. Asserting
+    on classes alone does not catch that - the 15.2 m shell on a generated
+    clear-span building passed a class-only assertion."""
+    from ifc_to_apdl.config import ConversionConfig
+    from ifc_to_apdl.pipeline import convert_file
+
+    a = _hall(height=4.0)
+    a.panel("IfcWall", "Panel wall", (6.0, -0.25, 0.0), 12.6, 0.1009, 4.2, IMP)
+    a.slab("Composite deck", -0.1, -0.1, 12.1, 9.1, 4.2, 0.13,
+           layers=[(0.001, "Metal deck"), (0.129, "Concrete C30/37")])
+    res = convert_file(a.save(tmp_path / "deck.ifc"), tmp_path / "out", ConversionConfig())
+    text = next(r for r in res if r.system.domain == "building").deck.read_text()
+
+    thicknesses, shell = [], False
+    for line in text.splitlines():
+        if line.startswith("SECTYPE"):
+            shell = ",SHELL," in line
+        elif shell and line.startswith("SECDATA"):
+            thicknesses.append(float(line.split(",")[1]))
+    assert thicknesses, "no shell section emitted; the assertion below would pass on nothing"
+    assert max(thicknesses) < 0.5, f"envelope shell in the deck: {thicknesses}"
+
+
 @pytest.mark.parametrize("path", [NUCLEAR_ISLAND, MODEL_33], ids=["nuclear_island", "model33"])
 def test_turbine_hall_envelope(path):
     if not path.exists():
@@ -106,4 +178,5 @@ def test_turbine_hall_envelope(path):
     excluded = {e.name for e in ctx.audit.entries.values() if "envelope" in e.detail}
     assert excluded == {"Wall 1", "Wall 2", "Wall 3", "Wall 4", "Roof Slab"}
     bldg = next(s for s in systems if s.domain == "building")
-    assert not {ctx.products[g].ifc_class for g in bldg.product_guids} & {"IfcWall", "IfcSlab"}
+    assert not ({ctx.products[g].ifc_class for g in bldg.product_guids}
+                & {"IfcWall", "IfcSlab", "IfcRoof", "IfcPlate"})

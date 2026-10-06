@@ -541,6 +541,10 @@ def _split_envelope(recs, ctx: IfcContext):
         directly beneath carry it everywhere (``DECK_SUPPORT_SPACING``).
     A non-structural build-up without the second signal only earns a review
     warning; the element is kept.
+    An element decomposed into parts through ``IfcRelAggregates`` holds no
+    geometry of its own, so neither signal has anything to read and only
+    declared evidence can settle it. Its parts then inherit its verdict: the
+    skins and core of a non-load-bearing panel are not load-bearing either.
     Returns ``(envelope, rest)`` with envelope as ``(record, evidence)`` pairs.
     """
     import ifcopenshell.util.element as ioe
@@ -555,7 +559,9 @@ def _split_envelope(recs, ctx: IfcContext):
     envelope, rest = [], []
     for r in recs:
         why = None
-        if r.ifc_class in ("IfcWall", "IfcSlab", "IfcRoof") and clouds[r.guid] is not None:
+        parts = _parts_of(r.entity) if clouds[r.guid] is None else []
+        if (r.ifc_class in ("IfcWall", "IfcSlab", "IfcRoof")
+                and (clouds[r.guid] is not None or parts)):
             declared, pset = _declared_load_bearing(r)
             ptype = (ioe.get_predefined_type(r.entity) or "").upper()
             if declared is not None:
@@ -564,6 +570,15 @@ def _split_envelope(recs, ctx: IfcContext):
                 why = None
             elif r.ifc_class == "IfcWall" and ptype in NONBEARING_WALL_TYPES:
                 why = f"declared PredefinedType {ptype}"
+            elif parts:
+                # the parts hold the geometry, so neither signal can be read
+                # here; keeping an undeclared element errs towards converting
+                # a doubtful one, as the signals themselves do
+                ctx.audit.event("classification",
+                                f"'{r.name}' is decomposed into {len(parts)} part(s) and "
+                                "has no body of its own; nothing declares "
+                                "LoadBearing, so neither envelope signal can be read - "
+                                "kept, review", guid=r.guid, severity="warning")
             else:
                 signals = (_wall_signals(r, recs, clouds, feet, ctx) if r.ifc_class == "IfcWall"
                            else _deck_signals(r, recs, clouds, ctx))
@@ -580,7 +595,45 @@ def _split_envelope(recs, ctx: IfcContext):
             rest.append(r)
         else:
             envelope.append((r, why))
-    return envelope, rest
+
+    # a part inherits the structural role of the element it decomposes. The
+    # pieces of a panel are ordinary products in their own right, so without
+    # this the skins carrying its geometry convert as structure on their own
+    # while the panel they belong to is excluded.
+    verdicts = {r.guid: why for r, why in envelope}
+    kept = []
+    for r in rest:
+        parent, why = _excluded_ancestor(r, verdicts)
+        if parent is None:
+            kept.append(r)
+        else:
+            envelope.append((r, f"part of '{parent}', {why}"))
+    return envelope, kept
+
+
+def _parts_of(entity):
+    """Decomposition parts of an element. ``IfcRelAggregates`` only: nesting
+    is a different relationship and does not make a part of the whole."""
+    return [p for rel in getattr(entity, "IsDecomposedBy", None) or []
+            if rel.is_a("IfcRelAggregates") for p in rel.RelatedObjects]
+
+
+def _excluded_ancestor(rec, verdicts: dict):
+    """``(name, evidence)`` of the nearest element this record decomposes that
+    was excluded as envelope, else ``(None, None)``. Walks the aggregation
+    chain so a part of a part resolves, under the same depth cap the spatial
+    walk uses."""
+    import ifcopenshell.util.element as ioe
+
+    node = rec.entity
+    for _ in range(12):
+        parent = ioe.get_aggregate(node)
+        if parent is None:
+            break
+        if parent.GlobalId in verdicts:
+            return (parent.Name or parent.is_a()), verdicts[parent.GlobalId]
+        node = parent
+    return None, None
 
 
 def _declared_load_bearing(rec):
