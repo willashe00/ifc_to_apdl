@@ -71,8 +71,9 @@ class Author:
             float(np.linalg.norm(p1 - p0)))
         return self.product(cls, name, p0, [solid], "SweptSolid", self.steel)
 
-    def i_beam(self, name, p0, p1, d=0.4, bf=0.2, tw=0.01, tf=0.015):
-        """IfcBeam of an I profile (depth vertical) along a horizontal axis."""
+    def i_beam(self, name, p0, p1, d=0.4, bf=0.2, tw=0.01, tf=0.015, cls="IfcBeam"):
+        """IfcBeam (or ``cls``, e.g. an IfcMember truss chord) of an I profile
+        (depth vertical) along a horizontal axis."""
         f = self.f
         p0, p1 = np.asarray(p0, float), np.asarray(p1, float)
         axis = (p1 - p0) / np.linalg.norm(p1 - p0)
@@ -81,7 +82,7 @@ class Author:
             f.createIfcIShapeProfileDef("AREA", None, None, bf, d, tw, tf, None),
             self.a2p((0, 0, 0), tuple(axis), ref), f.createIfcDirection((0.0, 0.0, 1.0)),
             float(np.linalg.norm(p1 - p0)))
-        return self.product("IfcBeam", name, p0, [solid], "SweptSolid", self.steel)
+        return self.product(cls, name, p0, [solid], "SweptSolid", self.steel)
 
     def rack(self, x0, y0):
         """Named 4-column equipment support rack (2.5 m square, 4 m tall)."""

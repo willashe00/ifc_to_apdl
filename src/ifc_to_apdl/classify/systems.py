@@ -32,6 +32,9 @@ class SystemRecord:
     evidence: list[str] = field(default_factory=list)
     #: columns whose base plate was excluded: fixed at the foot in place of it
     fixed_columns: list[str] = field(default_factory=list)
+    #: excluded gusset plates: web members ending on one frame into the chord
+    #: it is seated on in place of it
+    gusset_plates: list[str] = field(default_factory=list)
 
 
 def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[SystemRecord]:
@@ -123,12 +126,15 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
     b_idx = c_idx = 0
     connection_hw: set[str] = set()
     for bldg, recs in sorted(by_building.items()):
-        # column base plates and shear tabs are connection hardware, not
-        # frame: excluded first (a leftover plate would also defeat the
-        # bare-cage rack rule). The columns standing on base plates are fixed
-        # at the foot instead; beams frame directly into their supports
+        # column base plates, shear tabs and gusset plates are connection
+        # hardware, not frame: excluded first (a leftover plate would also
+        # defeat the bare-cage rack rule). The columns standing on base plates
+        # are fixed at the foot instead; beams frame directly into their
+        # supports, and truss web members into the chords the gussets are
+        # seated on
         plates, recs, seated = _split_base_plates(recs, ctx)
         tabs, recs = _split_shear_tabs(recs, ctx)
+        gussets, recs = _split_gusset_plates(recs)
         for r, why in plates:
             ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
                              detail=f"column base plate ({why}) - connection hardware; "
@@ -137,9 +143,14 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
             ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
                              detail=f"shear tab ({why}) - connection hardware; the beam "
                                     "frames directly into its support instead")
+        for r, why in gussets:
+            ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
+                             detail=f"gusset plate ({why}) - connection hardware; the web "
+                                    "members frame into the chord it is seated on instead")
         # their bolts, nuts and anchor bolts go with them
         n_hw = 0
-        for kind, group in (("column base plate", plates), ("shear tab", tabs)):
+        for kind, group in (("column base plate", plates), ("shear tab", tabs),
+                            ("gusset plate", gussets)):
             for r, _ in group:
                 label, fasteners = _connection_fasteners(r, ctx)
                 for part in fasteners:
@@ -213,7 +224,8 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                     product_guids=[r.guid for r in frame],
                     evidence=[f"framing inside containment-{c_idx}: "
                               f"{sorted({r.ifc_class for r in frame})}"],
-                    fixed_columns=[g for g in seated if g in {r.guid for r in frame}]))
+                    fixed_columns=[g for g in seated if g in {r.guid for r in frame}],
+                    gusset_plates=[r.guid for r, _ in gussets]))
         else:
             # an ordinary building: a round slab on grade is a ground slab too
             ground += _split_ground_slabs(shells, recs, ctx)[0]
@@ -230,7 +242,8 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                                             product_guids=[r.guid for r in frame],
                                             evidence=[f"framing classes {sorted(classes)}"],
                                             fixed_columns=[g for g in seated
-                                                           if g in {r.guid for r in frame}]))
+                                                           if g in {r.guid for r in frame}],
+                                            gusset_plates=[r.guid for r, _ in gussets]))
         for r, why in ground:
             ctx.audit.record(r.guid, r.ifc_class, r.name, AuditStatus.EXCLUDED,
                              detail=f"ground slab ({why}) - rests on grade; the column / "
@@ -248,6 +261,8 @@ def classify_systems(ctx: IfcContext, proximity_tol: float = 1e-3) -> list[Syste
                                   f"{len(s.fixed_columns)} column(s) fixed at the foot")
             if tabs and s.domain == "building":
                 s.evidence.append(f"{len(tabs)} shear tab(s) excluded")
+            if gussets and s.domain == "building":
+                s.evidence.append(f"{len(gussets)} gusset plate(s) excluded")
             if n_hw and s.domain == "building":
                 s.evidence.append(f"{n_hw} connection fastener(s) excluded with their plates")
             if ground and s.domain == "building":
@@ -308,6 +323,11 @@ THIN_PLATE_RATIO = 0.2
 #: (the plate runs parallel to the web) or the vertical (the plate stands
 #: upright like the web of a gravity beam)
 LAP_PARALLEL_COS = 0.05
+
+#: name tokens marking gusset plates - the plates joining truss web members
+#: (or braces) to a chord at a panel point - in the plate name, ObjectType,
+#: or the name of the element assembly the plate is aggregated into
+GUSSET_PLATE_TOKENS = ("gusset plate", "gussetplate", "gusset_plate", "gusset-plate")
 
 
 def _split_base_plates(recs, ctx: IfcContext):
@@ -395,6 +415,38 @@ def _split_shear_tabs(recs, ctx: IfcContext):
         else:
             tabs.append((r, why))
     return tabs, rest
+
+
+def _split_gusset_plates(recs):
+    """Separate gusset plates from the structural products.
+
+    A gusset plate joins truss web members (or braces) to a chord at a panel
+    point. It is connection hardware: the building assembler extends the
+    web members through it so they frame into the chord axis, and the plate
+    is not converted. Evidence (first hit wins):
+      * declared - PredefinedType GUSSET_PLATE on the occurrence or its type
+        object (IFC4X3 IfcPlateTypeEnum);
+      * named - the plate, its ObjectType, or the element assembly it is
+        aggregated into carries a gusset token (``GUSSET_PLATE_TOKENS``).
+    There is no geometric rule: a thin plate where members meet may as well
+    be a splice or stiffener plate, which is primary structure.
+    Returns ``(gussets, rest)`` with gussets as ``(record, evidence)`` pairs.
+    """
+    import ifcopenshell.util.element as ioe
+
+    gussets, rest = [], []
+    for r in recs:
+        why = None
+        if r.ifc_class == "IfcPlate":
+            if (ioe.get_predefined_type(r.entity) or "").upper() == "GUSSET_PLATE":
+                why = "declared PredefinedType GUSSET_PLATE"
+            elif any(tok in _plate_labels(r) for tok in GUSSET_PLATE_TOKENS):
+                why = "gusset-plate naming"
+        if why is None:
+            rest.append(r)
+        else:
+            gussets.append((r, why))
+    return gussets, rest
 
 
 def _lapped_beam_ends(v, beams) -> list[str]:
