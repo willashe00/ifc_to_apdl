@@ -32,8 +32,12 @@ formalized with a planar arrangement instead of ad-hoc rules):
      vertex on a wall trace becomes a wall partition station.
   4a. brace workpoints to column axes / beam planes (an end on a beam's top
      or bottom face, e.g. a truss web member cut to the chord face, lands on
-     the chord axis); crossing or interrupted diagonals (X-bracing) noded at
-     their common point
+     the chord axis; an end stopping on an excluded gusset plate is first
+     extended through the gusset clearance to the face of the chord the
+     plate is seated on, and a chord running on past its outermost gusset
+     work point to a free end inside the gusset is trimmed back to it);
+     crossing or interrupted diagonals (X-bracing) noded at their common
+     point
   5. walls partitioned at storey planes, crossing framing lines, other wall
      traces, arrangement vertices and member attachment points
   5b. conformity enforcement: any pool node lying on the interior of a member
@@ -51,12 +55,12 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import shapely
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, MultiPoint, Point, Polygon
 from shapely.ops import polygonize, substring, unary_union
 
 from ..assign.elements import resolve_element_type
 from ..assign.materials import MaterialResolver
-from ..classify.systems import SystemRecord
+from ..classify.systems import SystemRecord, _cloud
 from ..config import ConversionConfig
 from ..geometry.axes import axis_rep_endpoints
 from ..geometry.profiles import parse_profile
@@ -126,6 +130,30 @@ class RawSlab:
     z_mid: float
     thickness: float
     evidence: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class RawGusset:
+    """An excluded gusset plate, kept as evidence for the work points of the
+    members ending on it: mid-plane frame (in-plane axes ``e1``/``e2``),
+    half thickness and in-plane outline."""
+    rec: ProductRecord
+    centre: np.ndarray
+    e1: np.ndarray
+    e2: np.ndarray
+    normal: np.ndarray
+    half_t: float
+    outline: Polygon
+
+    def local(self, p) -> tuple[float, float, float]:
+        d = np.asarray(p, dtype=float) - self.centre
+        return float(d @ self.e1), float(d @ self.e2), float(d @ self.normal)
+
+    def holds(self, p, off_plane: float, tol: float) -> bool:
+        """``p`` lies on the plate: within ``off_plane`` of its faces and
+        within ``tol`` of its outline."""
+        u, v, w = self.local(p)
+        return abs(w) <= self.half_t + off_plane and self.outline.distance(Point(u, v)) <= tol
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +320,123 @@ def _slab_from(rec: ProductRecord, ctx: IfcContext) -> RawSlab | None:
     if holes:
         ev["voids"] = f"{len(holes)} opening(s) preserved"
     return RawSlab(rec, poly, z_mid, plate.thickness, ev)
+
+
+def _gusset_from(rec: ProductRecord, ctx: IfcContext) -> RawGusset | None:
+    """Principal frame and outline of a gusset plate body in any encoding."""
+    v = _cloud(rec, ctx)
+    if v is None or len(v) < 4:
+        return None
+    centre = v.mean(axis=0)
+    _, _, vt = np.linalg.svd(v - centre, full_matrices=False)
+    loc = (v - centre) @ vt.T
+    outline = MultiPoint([(float(a), float(b)) for a, b in loc[:, :2]]).convex_hull
+    if outline.geom_type != "Polygon":
+        return None
+    return RawGusset(rec, centre, vt[0], vt[1], vt[2], float(np.ptp(loc[:, 2])) / 2.0, outline)
+
+
+def _gusset_workpoint(b: RawBeam, pt: np.ndarray, other: np.ndarray,
+                      gussets: list[RawGusset], horiz: list[RawBeam], snap_tol: float):
+    """Chord work point of an inclined member end ``pt`` lying on a gusset
+    plate; ``other`` is the member's other end as authored, so the axis is
+    not skewed by a work point already found for it.
+
+    Truss web members stop at the edge of their gusset, short of the chord
+    face by the gusset clearance. The plate is seated on a chord face (the
+    chord axis lies in the plate plane, within half a chord depth of its
+    outline); the member is extended along its own axis to that face, where
+    a member cut to the chord face would end, provided the plate spans the
+    whole clearance. Returns ``(extension, face point, gusset, chord)`` for
+    the shortest extension, or None.
+    """
+    u = np.asarray(pt, dtype=float) - np.asarray(other, dtype=float)
+    length = float(np.linalg.norm(u))
+    if length < LEVEL_TOL:
+        return None
+    u /= length
+    if abs(u[2]) < 1e-6:
+        return None                             # horizontal: never reaches a chord face
+    # the member axis lies in the gusset plane, or a member lapping the
+    # gusset sits up to its own half width off it
+    off_plane = max(getattr(b.section, "width", 0.0), getattr(b.section, "depth", 0.0),
+                    getattr(b.section, "od", 0.0)) / 2.0 + snap_tol
+    best = None
+    for g in gussets:
+        if not g.holds(pt, off_plane, snap_tol):
+            continue
+        for hb in horiz:
+            z_c = float(hb.start[2]) + hb.lifted_offset        # chord centroid
+            a = (hb.start[0], hb.start[1], z_c)
+            e = (hb.end[0], hb.end[1], z_c)
+            (ua, va, wa), (ue, ve, we) = g.local(a), g.local(e)
+            half_w = max(getattr(hb.section, "width", 0.0), 0.05) / 2.0
+            if max(abs(wa), abs(we)) > half_w + snap_tol:
+                continue                        # chord not in the plate plane
+            if g.outline.distance(LineString([(ua, va), (ue, ve)])) > hb.depth / 2.0 + snap_tol:
+                continue                        # plate not seated on this chord
+            face = z_c + (hb.depth / 2.0 if pt[2] > z_c else -hb.depth / 2.0)
+            s = (face - float(pt[2])) / float(u[2])
+            if s < -snap_tol:
+                continue                        # end not heading for this chord
+            s = max(s, 0.0)
+            q = np.asarray(pt, dtype=float) + s * u
+            if not g.holds(q, off_plane, snap_tol):
+                continue                        # the plate does not bridge the clearance
+            line = LineString([(hb.start[0], hb.start[1]), (hb.end[0], hb.end[1])])
+            if line.distance(Point(q[0], q[1])) > half_w + snap_tol:
+                continue                        # face point beyond the chord's extent
+            if best is None or s < best[0]:
+                best = (s, q, g, hb)
+    return best
+
+
+def _overhang_carried(hb: RawBeam, line: LineString, t_wp: float, t_end: float, z_c: float,
+                      beams: list[RawBeam], columns: list[RawColumn], walls: list[RawWall],
+                      slabs: list[RawSlab], snap_tol: float, merge_tol: float) -> str | None:
+    """What frames into the part of chord ``hb`` past its work point at
+    station ``t_wp`` towards its end at ``t_end`` (stations along the plan
+    ``line``, centroid at ``z_c``): a column, wall or slab touching it,
+    another member ending on it (a spliced chord piece, a strut, a brace) or
+    a horizontal member crossing it. None when nothing does."""
+    sign = 1.0 if t_end > t_wp else -1.0
+    seg = substring(line, *sorted((t_wp + sign * merge_tol, t_end)))
+    half_w = max(getattr(hb.section, "width", 0.0), 0.05) / 2.0
+    lo, hi = z_c - hb.depth / 2.0, z_c + hb.depth / 2.0
+
+    def past_wp(xy, reach: float) -> bool:
+        p = Point(xy[0], xy[1])
+        return line.distance(p) <= reach and sign * (line.project(p) - t_wp) > merge_tol
+
+    for c in columns:
+        if (c.base[2] - 0.5 <= z_c <= c.top[2] + 0.5
+                and past_wp(c.base, c.plan_halfwidth + snap_tol)):
+            return f"column '{c.rec.name}'"
+    for ob in beams:
+        if ob is hb:
+            continue
+        for q in (ob.start, ob.end):
+            if ((abs(q[2] - z_c) <= hb.depth / 2.0 + snap_tol
+                 or abs(q[2] - hb.start[2]) <= snap_tol)
+                    and past_wp(q, half_w + snap_tol)):
+                return f"'{ob.rec.name}'"
+        if (abs(ob.start[2] - ob.end[2]) < LEVEL_TOL
+                and abs(float(ob.start[2]) + ob.lifted_offset - z_c)
+                <= (ob.depth + hb.depth) / 2.0 + snap_tol
+                and LineString([(ob.start[0], ob.start[1]),
+                                (ob.end[0], ob.end[1])]).intersects(seg)):
+            return f"'{ob.rec.name}'"
+    for w in walls:
+        if (w.z_lo - snap_tol <= hi and w.z_hi + snap_tol >= lo
+                and w.trace2d().distance(seg) <= w.thickness / 2.0 + half_w + snap_tol):
+            return f"wall '{w.rec.name}'"
+    for s in slabs:
+        if ((s.z_mid - s.thickness / 2.0 - snap_tol <= hi
+             and s.z_mid + s.thickness / 2.0 + snap_tol >= lo)
+                or abs(s.z_mid - hb.start[2]) <= max(LEVEL_TOL, snap_tol)):
+            if s.poly.distance(seg) <= snap_tol:
+                return f"slab '{s.rec.name}'"
+    return None
 
 
 def _snap_ring_to_line(ring, line: LineString, tol: float):
@@ -935,10 +1080,39 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
     #    braces: a column axis, or a beam axis in its (lifted) level plane.
     #    Beam attachment points are injected into the level arrangement so
     #    the beam is noded there (conformal chevron/V apexes).
+    #    An end on an excluded gusset plate frames into the chord the plate
+    #    is seated on: extended along its own axis through the gusset
+    #    clearance to the chord face, it lands on the chord axis like a
+    #    member cut to that face.
     injections: dict[float, list[tuple[float, float]]] = defaultdict(list)
-    n_reconciled = 0
+    gussets = [g for g in (_gusset_from(ctx.products[guid], ctx)
+                           for guid in system.gusset_plates if guid in ctx.products)
+               if g is not None]
+    n_reconciled = n_gusset = 0
+    #: id(chord) -> (chord, [(work point x, y, gusset)])
+    chord_wps: dict[int, tuple[RawBeam, list]] = {}
     for b in incl:
-        for pt in (b.start, b.end):
+        authored = (b.end.copy(), b.start.copy())
+        for pt, other in zip((b.start, b.end), authored):
+            hit = (_gusset_workpoint(b, pt, other, gussets, horiz, snap_tol)
+                   if gussets else None)
+            if hit is not None:
+                s, q, g, hb = hit
+                line = LineString([(hb.start[0], hb.start[1]), (hb.end[0], hb.end[1])])
+                wp = line.interpolate(line.project(Point(q[0], q[1])))
+                lz_key = next((z for z in level_zs
+                               if abs(z - hb.start[2]) < max(LEVEL_TOL, snap_tol)),
+                              float(hb.start[2]))
+                pt[0], pt[1], pt[2] = wp.x, wp.y, lz_key
+                note = f"'{g.rec.name}' +{s:.3f} m -> '{hb.rec.name}'"
+                b.evidence["gusset"] = (f"{b.evidence['gusset']}; {note}"
+                                        if "gusset" in b.evidence else note)
+                b.evidence["workpoint"] = ("end on a gusset plate extended to the chord "
+                                           "face -> chord axis")
+                injections[lz_key].append((wp.x, wp.y))
+                chord_wps.setdefault(id(hb), (hb, []))[1].append((wp.x, wp.y, g))
+                n_gusset += 1
+                continue
             snapped = False
             for c in columns:
                 r = math.hypot(pt[0] - c.base[0], pt[1] - c.base[1])
@@ -988,6 +1162,54 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
         ctx.audit.event("geometry",
                         f"{system.name}: {n_reconciled} inclined-member workpoint(s) "
                         "reconciled to column axes / beam planes")
+    if n_gusset:
+        ctx.audit.event("geometry",
+                        f"{system.name}: {n_gusset} web-member end(s) on {len(gussets)} "
+                        "gusset plate(s) extended to the chord faces and landed on the "
+                        "chord axes [gusset work points]")
+    # -- chord overhangs: analytical truss members run work point to work
+    #    point. A chord cut to the edge of its end gusset (a Pratt bottom
+    #    chord stopping short of the supports) runs on past its outermost
+    #    work point to a free end that carries nothing; it is trimmed back to
+    #    that work point, unless anything else frames into the overhang.
+    n_trim = 0
+    for hb, wps in chord_wps.values():
+        line = LineString([(hb.start[0], hb.start[1]), (hb.end[0], hb.end[1])])
+        ts = sorted(line.project(Point(x, y)) for x, y, _ in wps)
+        z_c = float(hb.start[2]) + hb.lifted_offset
+        half_w = max(getattr(hb.section, "width", 0.0), 0.05) / 2.0
+        trims = []
+        for pt, t_wp, t_end in ((hb.start, ts[0], 0.0), (hb.end, ts[-1], line.length)):
+            if abs(t_end - t_wp) <= merge_tol:
+                continue                                # ends at its work point
+            # the free end lies inside a gusset this chord is seated against
+            if not any(g.holds((pt[0], pt[1], z_c + math.copysign(hb.depth / 2.0,
+                                                                  g.centre[2] - z_c)),
+                               half_w + snap_tol, snap_tol)
+                       for g in {id(g): g for _, _, g in wps}.values()):
+                continue
+            carried = _overhang_carried(hb, line, t_wp, t_end, z_c, beams, columns, walls,
+                                        slabs, snap_tol, merge_tol)
+            if carried:
+                ctx.audit.event("geometry",
+                                f"{system.name}: chord '{hb.rec.name}' overhang past its "
+                                f"outermost gusset work point kept - {carried} frames into it",
+                                guid=hb.rec.guid)
+                continue
+            trims.append((pt, line.interpolate(t_wp), abs(t_end - t_wp)))
+        if trims and line.length - sum(d for _, _, d in trims) > merge_tol:
+            for pt, wp, d in trims:
+                pt[0], pt[1] = wp.x, wp.y
+                note = f"{d:.3f} m"
+                hb.evidence["overhang"] = (f"{hb.evidence['overhang']}; {note}"
+                                           if "overhang" in hb.evidence
+                                           else f"trimmed to the outermost gusset work "
+                                                f"point: {note}")
+                n_trim += 1
+    if n_trim:
+        ctx.audit.event("geometry",
+                        f"{system.name}: {n_trim} chord overhang(s) past the outermost "
+                        "gusset work point trimmed [work point to work point]")
     # -- step 4b: junction noding of inclined members. X-bracing (one
     #    continuous diagonal, one interrupted at the crossing) and braces
     #    meeting at gussets must share the common point: split every inclined
