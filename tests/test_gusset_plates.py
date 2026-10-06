@@ -2,7 +2,9 @@
 (declared GUSSET_PLATE or naming), and the building assembler extends the
 truss web members that stop on them through the gusset clearance to the
 chord faces, so they frame into the chord axes at concentric work points.
-Bottom chords stopping short of the columns hang on the web members."""
+Bottom chords stopping short of the columns hang on the web members and run
+work point to work point: the overhang to the edge of the end gusset is
+trimmed unless something frames into it."""
 
 from collections import defaultdict
 from pathlib import Path
@@ -16,7 +18,7 @@ from ifc_to_apdl.assign.materials import MaterialResolver
 from ifc_to_apdl.classify.systems import classify_systems
 from ifc_to_apdl.config import ConversionConfig
 from ifc_to_apdl.ingest.loader import load_ifc
-from ifc_to_apdl.verify.connectivity import connectivity_report
+from ifc_to_apdl.verify.connectivity import connectivity_report, free_joint_report
 from ifc_authoring import Author
 
 FACE = 0.15                            # column face offset from its axis
@@ -91,9 +93,18 @@ def _incident(model):
     return inc
 
 
+def _x_range(model, name):
+    xs = [model.nodes.xyz(n)[0] for m in model.members if m.prov.name == name
+          for n in (m.start, m.end)]
+    return round(min(xs), 3), round(max(xs), 3)
+
+
+def _gusset_by_type(i, top):
+    return f"Plate {i}{'T' if top else 'B'}", {"predefined_type": "GUSSET_PLATE"}
+
+
 @pytest.mark.parametrize("gusset, evidence, n_bolts", [
-    (lambda i, top: (f"Plate {i}{'T' if top else 'B'}", {"predefined_type": "GUSSET_PLATE"}),
-     "declared PredefinedType GUSSET_PLATE", 0),
+    (_gusset_by_type, "declared PredefinedType GUSSET_PLATE", 0),
     (lambda i, top: (f"Gusset Plate at {'Top' if top else 'Bottom'} Chord Panel Point {i}", {}),
      "gusset-plate naming", 0),
     (lambda i, top: (f"Plate {i}{'T' if top else 'B'}",
@@ -128,11 +139,29 @@ def test_gusset_plates_excluded_and_webs_framed_into_chords(tmp_path, gusset, ev
     assert work_points == ({(round(x, 3), ZT) for x in PP}
                            | {(round(x, 3), ZB) for x in PP[1:4]})
     assert all("gusset" in m.prov.evidence for m in model.members if is_web(m.prov.name))
-    # the bottom chord stays clear of the columns: it hangs on the web members
-    bottom = {n for m in model.members if m.prov.name == "Bottom chord" for n in (m.start, m.end)}
-    assert all(min(abs(model.nodes.xyz(n)[0]), abs(model.nodes.xyz(n)[0] - 6.0)) > 1.0
-               for n in bottom)
+    # the bottom chord stays clear of the columns, hanging on the web
+    # members, and runs work point to work point: no overhang, no free end
+    assert _x_range(model, "Bottom chord") == (PP[1], PP[3])
+    assert _x_range(model, "Top chord") == (0.0, 6.0)
+    assert not free_joint_report(model)
     assert not [e for e in ctx.audit.entries.values() if e.status == "unhandled"]
+
+
+def test_overhang_something_frames_into_is_kept(tmp_path):
+    """A strut framing into the tip of one bottom-chord overhang keeps that
+    overhang; the free one at the other end is still trimmed."""
+    a = _truss(_gusset_by_type)
+    tip = PP[1] - OVERHANG
+    a.rect_member("IfcMember", "Bottom chord strut", (tip, -2.0, ZB), (tip, -0.1, ZB),
+                  b=0.1, d=0.1)
+    ctx = load_ifc(a.save(tmp_path / "strut.ifc"))
+    model = _assemble(ctx, classify_systems(ctx)[0])
+    assert _x_range(model, "Bottom chord") == (round(tip, 3), PP[3])
+    strut = {n for m in model.members if m.prov.name == "Bottom chord strut"
+             for n in (m.start, m.end)}
+    assert "Bottom chord" in set().union(*(_incident(model)[n] for n in strut))
+    assert any("overhang past its outermost gusset work point kept - 'Bottom chord strut'"
+               in e.message for e in ctx.audit.events)
 
 
 def test_web_members_are_extended_only_through_gussets(tmp_path):
@@ -176,6 +205,13 @@ def test_model_42_pratt_trusses():
     ends = _web_ends(model, webs.__contains__)
     assert len(ends) == 115 and all(len(e) == 2 for e in ends.values())
     assert all(inc[n] & chords for e in ends.values() for n in e)
+    # chords run work point to work point: no overhang left as a free end
+    assert not free_joint_report(model)
+    for name in (n for n, t in role.items() if t == "BOTTOM_CHORD"):
+        ext = _x_range(model, name)
+        tips = [n for m in model.members if m.prov.name == name for n in (m.start, m.end)
+                if round(model.nodes.xyz(n)[0], 3) in ext]
+        assert all(inc[n] & webs for n in tips)
     # bottom chords stop short of the columns (Pratt truss configuration)
     col_xy = {model.nodes.xyz(n)[:2] for m in model.members if m.prov.ifc_class == "IfcColumn"
               for n in (m.start, m.end)}

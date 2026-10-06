@@ -34,8 +34,10 @@ formalized with a planar arrangement instead of ad-hoc rules):
      or bottom face, e.g. a truss web member cut to the chord face, lands on
      the chord axis; an end stopping on an excluded gusset plate is first
      extended through the gusset clearance to the face of the chord the
-     plate is seated on); crossing or interrupted diagonals (X-bracing)
-     noded at their common point
+     plate is seated on, and a chord running on past its outermost gusset
+     work point to a free end inside the gusset is trimmed back to it);
+     crossing or interrupted diagonals (X-bracing) noded at their common
+     point
   5. walls partitioned at storey planes, crossing framing lines, other wall
      traces, arrangement vertices and member attachment points
   5b. conformity enforcement: any pool node lying on the interior of a member
@@ -387,6 +389,54 @@ def _gusset_workpoint(b: RawBeam, pt: np.ndarray, other: np.ndarray,
             if best is None or s < best[0]:
                 best = (s, q, g, hb)
     return best
+
+
+def _overhang_carried(hb: RawBeam, line: LineString, t_wp: float, t_end: float, z_c: float,
+                      beams: list[RawBeam], columns: list[RawColumn], walls: list[RawWall],
+                      slabs: list[RawSlab], snap_tol: float, merge_tol: float) -> str | None:
+    """What frames into the part of chord ``hb`` past its work point at
+    station ``t_wp`` towards its end at ``t_end`` (stations along the plan
+    ``line``, centroid at ``z_c``): a column, wall or slab touching it,
+    another member ending on it (a spliced chord piece, a strut, a brace) or
+    a horizontal member crossing it. None when nothing does."""
+    sign = 1.0 if t_end > t_wp else -1.0
+    seg = substring(line, *sorted((t_wp + sign * merge_tol, t_end)))
+    half_w = max(getattr(hb.section, "width", 0.0), 0.05) / 2.0
+    lo, hi = z_c - hb.depth / 2.0, z_c + hb.depth / 2.0
+
+    def past_wp(xy, reach: float) -> bool:
+        p = Point(xy[0], xy[1])
+        return line.distance(p) <= reach and sign * (line.project(p) - t_wp) > merge_tol
+
+    for c in columns:
+        if (c.base[2] - 0.5 <= z_c <= c.top[2] + 0.5
+                and past_wp(c.base, c.plan_halfwidth + snap_tol)):
+            return f"column '{c.rec.name}'"
+    for ob in beams:
+        if ob is hb:
+            continue
+        for q in (ob.start, ob.end):
+            if ((abs(q[2] - z_c) <= hb.depth / 2.0 + snap_tol
+                 or abs(q[2] - hb.start[2]) <= snap_tol)
+                    and past_wp(q, half_w + snap_tol)):
+                return f"'{ob.rec.name}'"
+        if (abs(ob.start[2] - ob.end[2]) < LEVEL_TOL
+                and abs(float(ob.start[2]) + ob.lifted_offset - z_c)
+                <= (ob.depth + hb.depth) / 2.0 + snap_tol
+                and LineString([(ob.start[0], ob.start[1]),
+                                (ob.end[0], ob.end[1])]).intersects(seg)):
+            return f"'{ob.rec.name}'"
+    for w in walls:
+        if (w.z_lo - snap_tol <= hi and w.z_hi + snap_tol >= lo
+                and w.trace2d().distance(seg) <= w.thickness / 2.0 + half_w + snap_tol):
+            return f"wall '{w.rec.name}'"
+    for s in slabs:
+        if ((s.z_mid - s.thickness / 2.0 - snap_tol <= hi
+             and s.z_mid + s.thickness / 2.0 + snap_tol >= lo)
+                or abs(s.z_mid - hb.start[2]) <= max(LEVEL_TOL, snap_tol)):
+            if s.poly.distance(seg) <= snap_tol:
+                return f"slab '{s.rec.name}'"
+    return None
 
 
 def _snap_ring_to_line(ring, line: LineString, tol: float):
@@ -1039,6 +1089,8 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
                            for guid in system.gusset_plates if guid in ctx.products)
                if g is not None]
     n_reconciled = n_gusset = 0
+    #: id(chord) -> (chord, [(work point x, y, gusset)])
+    chord_wps: dict[int, tuple[RawBeam, list]] = {}
     for b in incl:
         authored = (b.end.copy(), b.start.copy())
         for pt, other in zip((b.start, b.end), authored):
@@ -1058,6 +1110,7 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
                 b.evidence["workpoint"] = ("end on a gusset plate extended to the chord "
                                            "face -> chord axis")
                 injections[lz_key].append((wp.x, wp.y))
+                chord_wps.setdefault(id(hb), (hb, []))[1].append((wp.x, wp.y, g))
                 n_gusset += 1
                 continue
             snapped = False
@@ -1114,6 +1167,49 @@ def assemble_building(ctx: IfcContext, system: SystemRecord,
                         f"{system.name}: {n_gusset} web-member end(s) on {len(gussets)} "
                         "gusset plate(s) extended to the chord faces and landed on the "
                         "chord axes [gusset work points]")
+    # -- chord overhangs: analytical truss members run work point to work
+    #    point. A chord cut to the edge of its end gusset (a Pratt bottom
+    #    chord stopping short of the supports) runs on past its outermost
+    #    work point to a free end that carries nothing; it is trimmed back to
+    #    that work point, unless anything else frames into the overhang.
+    n_trim = 0
+    for hb, wps in chord_wps.values():
+        line = LineString([(hb.start[0], hb.start[1]), (hb.end[0], hb.end[1])])
+        ts = sorted(line.project(Point(x, y)) for x, y, _ in wps)
+        z_c = float(hb.start[2]) + hb.lifted_offset
+        half_w = max(getattr(hb.section, "width", 0.0), 0.05) / 2.0
+        trims = []
+        for pt, t_wp, t_end in ((hb.start, ts[0], 0.0), (hb.end, ts[-1], line.length)):
+            if abs(t_end - t_wp) <= merge_tol:
+                continue                                # ends at its work point
+            # the free end lies inside a gusset this chord is seated against
+            if not any(g.holds((pt[0], pt[1], z_c + math.copysign(hb.depth / 2.0,
+                                                                  g.centre[2] - z_c)),
+                               half_w + snap_tol, snap_tol)
+                       for g in {id(g): g for _, _, g in wps}.values()):
+                continue
+            carried = _overhang_carried(hb, line, t_wp, t_end, z_c, beams, columns, walls,
+                                        slabs, snap_tol, merge_tol)
+            if carried:
+                ctx.audit.event("geometry",
+                                f"{system.name}: chord '{hb.rec.name}' overhang past its "
+                                f"outermost gusset work point kept - {carried} frames into it",
+                                guid=hb.rec.guid)
+                continue
+            trims.append((pt, line.interpolate(t_wp), abs(t_end - t_wp)))
+        if trims and line.length - sum(d for _, _, d in trims) > merge_tol:
+            for pt, wp, d in trims:
+                pt[0], pt[1] = wp.x, wp.y
+                note = f"{d:.3f} m"
+                hb.evidence["overhang"] = (f"{hb.evidence['overhang']}; {note}"
+                                           if "overhang" in hb.evidence
+                                           else f"trimmed to the outermost gusset work "
+                                                f"point: {note}")
+                n_trim += 1
+    if n_trim:
+        ctx.audit.event("geometry",
+                        f"{system.name}: {n_trim} chord overhang(s) past the outermost "
+                        "gusset work point trimmed [work point to work point]")
     # -- step 4b: junction noding of inclined members. X-bracing (one
     #    continuous diagonal, one interrupted at the crossing) and braces
     #    meeting at gussets must share the common point: split every inclined
